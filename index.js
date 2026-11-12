@@ -206,3 +206,185 @@ async function alTocarBoton(cb, dueño) {
   const texto = cb.message.text || "";
   if (!texto.startsWith(TITULO)) return responder("Mensaje no válido");
   const clave = `\( {chat}: \){mid}`;
+  if (yaPublicados.has(clave)) return responder("Ya se publicó");
+  yaPublicados.add(clave);
+  await responder("Publicando...");
+  await quitarBotones();
+  const res = await publicar(texto);
+  await enviar(chat, resultadoTexto(res));
+}
+
+const resultadoTexto = (res) =>
+  res.map(([dest, ok, err]) => (ok ? `\( {dest}: publicada` : ` \){dest}: ERROR (${err})`)).join("\n");
+
+async function publicar(texto) {
+  const res = [];
+  const chats = String(process.env.VIP_WHATSAPP_CHAT_ID || "").split(/[,\s;]+/).filter(Boolean);
+  if (process.env.GREENAPI_ID && process.env.GREENAPI_TOKEN && chats.length) {
+    const base = String(process.env.GREENAPI_URL || "https://api.green-api.com").replace(/\/+$/, "");
+    for (const chatId of chats) {
+      try {
+        const r = await fetch(`\( {base}/waInstance \){process.env.GREENAPI_ID}/sendMessage/${process.env.GREENAPI_TOKEN}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ chatId, message: texto }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok || !j.idMessage) throw new Error(`Green API ${r.status}`);
+        res.push(["WhatsApp Señales VIP", true]);
+      } catch (e) {
+        res.push(["WhatsApp Señales VIP", false, e.message]);
+      }
+    }
+  }
+  if (process.env.TELEGRAM_VIP_CHAT_ID) {
+    try {
+      await enviar(process.env.TELEGRAM_VIP_CHAT_ID, aHtml(texto), { parse_mode: "HTML" });
+      res.push(["Telegram VIP", true]);
+    } catch (e) {
+      res.push(["Telegram VIP", false, e.message]);
+    }
+  }
+  if (!res.length) throw new Error("No hay destinos configurados (VIP_WHATSAPP_CHAT_ID / TELEGRAM_VIP_CHAT_ID)");
+  return res;
+}
+
+function aBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+async function gemini(modelo, b64, mime) {
+  const cuerpo = JSON.stringify({
+    contents: [{ role: "user", parts: [{ text: PROMPT }, { inline_data: { mime_type: mime, data: b64 } }] }],
+    generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 1024 },
+  });
+  for (let intento = 0; intento < 2; intento++) {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
+      body: cuerpo,
+    });
+    if (r.ok) {
+      const j = await r.json();
+      const partes = j.candidates?.[0]?.content?.parts || [];
+      const texto = partes.map((p) => p.text || "").join("");
+      try {
+        return JSON.parse(texto);
+      } catch {
+        throw new Error("Gemini no devolvió JSON válido");
+      }
+    }
+    if (r.status === 429 || r.status >= 500) await new Promise((r) => setTimeout(r, 1200 * (intento + 1)));
+    else {
+      const err = await r.text().catch(() => "");
+      throw new Error(`Gemini ${r.status}: ${err.slice(0, 200)}`);
+    }
+  }
+  throw new Error("Gemini falló después de reintentos");
+}
+
+async function leerGrafico(b64, mime) {
+  const modelos = [
+    process.env.GEMINI_MODEL || "gemini-2.0-flash",
+    process.env.GEMINI_MODEL_2 || "gemini-1.5-flash",
+  ];
+  let ultimoError;
+  for (const m of modelos) {
+    try {
+      return await gemini(m, b64, mime);
+    } catch (e) {
+      ultimoError = e;
+    }
+  }
+  throw ultimoError || new Error("No pude leer el gráfico");
+}
+
+function num(v) {
+  if (v == null || v === "") return null;
+  if (typeof v === "number") return v;
+  const s = String(v).trim().replace(",", ".");
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function validar(l) {
+  const dir = (l.direccion || "").toUpperCase();
+  if (dir !== "BUY" && dir !== "SELL") return "Dirección inválida";
+  const entrada = num(l.entrada);
+  const sl = num(l.stop_loss);
+  const tp1 = num(l.take_profit_1);
+  if (entrada == null || sl == null || tp1 == null) return "Faltan entrada, SL o TP1";
+  if (dir === "BUY" && !(sl < entrada && entrada < tp1)) return "Para BUY debe ser SL < Entrada < TP";
+  if (dir === "SELL" && !(tp1 < entrada && entrada < sl)) return "Para SELL debe ser TP < Entrada < SL";
+  return null;
+}
+
+function fmt(n) {
+  if (n == null) return "";
+  const d = process.env.DECIMALES;
+  if (d && d !== "auto") return Number(n).toFixed(Number(d));
+  return String(n);
+}
+
+function armarSenal(lectura, ajustes = {}) {
+  const dir = (lectura.direccion || "").toUpperCase();
+  const instrumento = (ajustes.instrumento || lectura.instrumento || process.env.INSTRUMENTO_DEFECTO || "XAUUSD").toUpperCase();
+  const entrada = num(lectura.entrada);
+  const sl = num(lectura.stop_loss);
+  const tp1 = num(lectura.take_profit_1);
+  const tp2 = num(lectura.take_profit_2);
+  const tp3 = num(lectura.take_profit_3);
+
+  let estado = (ajustes.estado || "LIMIT PENDIENTE").toUpperCase();
+  if (ajustes.estado === "mercado") estado = "ACTIVA";
+
+  let texto = `${TITULO}\n\n`;
+  texto += `Instrumento: ${instrumento}\n`;
+  texto += `Operación:  ${dir}\n`;
+  texto += `Entrada: ${fmt(entrada)}\n`;
+  texto += `Stop Loss: ${fmt(sl)}\n`;
+  texto += `Take Profit : ${fmt(tp1)}`;
+  if (tp2 != null) texto += `\nTake Profit 2: ${fmt(tp2)}`;
+  if (tp3 != null) texto += `\nTake Profit 3: ${fmt(tp3)}`;
+  texto += `\n\nESTADO: ${estado}\n\n`;
+  texto += `\( {AVISO_RIESGO}\n\n \){AVISO_SL}\n\n${FIRMA}`;
+
+  const detalle = `Entrada ${fmt(entrada)} | SL ${fmt(sl)} | TP ${fmt(tp1)}`;
+  return { texto, direccion: dir, instrumento, detalle };
+}
+
+function leerCaption(caption) {
+  const t = (caption || "").toLowerCase();
+  const out = {};
+  const mTp2 = t.match(/tp2\s*[:=]?\s*([\d.,]+)/i);
+  const mTp3 = t.match(/tp3\s*[:=]?\s*([\d.,]+)/i);
+  if (mTp2) out.tp2 = mTp2[1];
+  if (mTp3) out.tp3 = mTp3[1];
+  if (/\bmercado\b/.test(t)) out.estado = "mercado";
+  if (/\blimit\b/.test(t)) out.estado = "LIMIT PENDIENTE";
+  if (/\bstop\b/.test(t)) out.estado = "STOP";
+  const mInst = t.match(/\b([A-Z]{3,10}(?:USD|USDT|JPY|EUR|GBP)?)\b/i);
+  if (mInst) out.instrumento = mInst[1].toUpperCase();
+  return out;
+}
+
+function leerManual(texto) {
+  const partes = texto.trim().split(/\s+/);
+  const out = { nums: [], estado: "LIMIT PENDIENTE" };
+  for (const p of partes.slice(1)) {
+    const low = p.toLowerCase();
+    if (low === "buy" || low === "sell") out.direccion = low.toUpperCase();
+    else if (low === "mercado") out.estado = "mercado";
+    else if (low === "limit") out.estado = "LIMIT PENDIENTE";
+    else if (low === "stop") out.estado = "STOP";
+    else if (/^[A-Za-z]{3,10}$/.test(p)) out.instrumento = p.toUpperCase();
+    else {
+      const n = num(p);
+      if (n != null) out.nums.push(n);
+    }
+  }
+  return out;
+}
