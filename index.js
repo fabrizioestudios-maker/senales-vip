@@ -1,3 +1,4 @@
+
 // TRADING INSTITUCIONAL | Bot de señales VIP (Railway)
 const express = require("express");
 const app = express();
@@ -46,12 +47,16 @@ const PORT = process.env.PORT || 3000;
 
 app.get("/", (req, res) => res.send("Bot de señales activo"));
 app.get("/setup", setup);
+
 app.post("/telegram", async (req, res) => {
   const secret = req.headers["x-telegram-bot-api-secret-token"];
+
   if (secret !== process.env.WEBHOOK_SECRET) {
     return res.status(403).send("forbidden");
   }
+
   res.send("ok");
+
   try {
     await procesar(req.body);
   } catch (e) {
@@ -65,7 +70,9 @@ async function setup(req, res) {
   if (!process.env.WEBHOOK_SECRET || req.query.key !== process.env.WEBHOOK_SECRET) {
     return res.status(403).send("forbidden");
   }
-  const url = `\( {req.protocol}:// \){req.get("host")}/telegram`;
+
+  const url = `${req.protocol}://${req.get("host")}/telegram`;
+
   try {
     const r = await tg("setWebhook", {
       url,
@@ -73,6 +80,7 @@ async function setup(req, res) {
       allowed_updates: ["message", "callback_query"],
       drop_pending_updates: true,
     });
+
     res.send(`Webhook configurado: ${JSON.stringify(r)}`);
   } catch (e) {
     res.status(500).send(e.message);
@@ -80,40 +88,64 @@ async function setup(req, res) {
 }
 
 async function tg(method, body) {
-  const r = await fetch(`https://api.telegram.org/bot\( {process.env.TELEGRAM_BOT_TOKEN}/ \){method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const r = await fetch(
+    `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
+
   const j = await r.json().catch(() => ({}));
-  if (!j.ok) throw new Error(`Telegram ${method}: ${j.description || r.status}`);
+
+  if (!j.ok) {
+    throw new Error(`Telegram ${method}: ${j.description || r.status}`);
+  }
+
   return j.result;
 }
 
 const enviar = (chat, text, extra = {}) =>
-  tg("sendMessage", { chat_id: chat, text, disable_web_page_preview: true, ...extra });
+  tg("sendMessage", {
+    chat_id: chat,
+    text,
+    disable_web_page_preview: true,
+    ...extra,
+  });
 
 function aHtml(texto) {
-  const esc = texto.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const esc = texto
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+
   return esc.replace(/\*(.+?)\*/g, "<b>$1</b>");
 }
 
 async function procesar(update) {
   const dueño = String(process.env.OWNER_ID || "");
+
   try {
-    if (update.callback_query) return await alTocarBoton(update.callback_query, dueño);
+    if (update.callback_query) {
+      return await alTocarBoton(update.callback_query, dueño);
+    }
+
     const m = update.message;
+
     if (!m || !m.from) return;
+
     const uid = String(m.from.id);
     const texto = (m.text || m.caption || "").trim();
 
     if (/^\/(start|id)\b/i.test(texto)) {
       await enviar(
         m.chat.id,
-        `Tu ID de Telegram: ${uid}\nID de este chat: ${m.chat.id}\nEl primero va como OWNER_ID; si este chat es el grupo VIP de Telegram, el segundo va como TELEGRAM_VIP_CHAT_ID.`,
+        `Tu ID de Telegram: ${uid}\nID de este chat: ${m.chat.id}\nEl primero va como OWNER_ID; si este chat es el grupo VIP de Telegram, el segundo va como TELEGRAM_VIP_CHAT_ID.`
       );
       return;
     }
+
     if (uid !== dueño) return;
 
     const foto = m.photo
@@ -121,32 +153,62 @@ async function procesar(update) {
       : m.document && /^image\//.test(m.document.mime_type || "")
         ? m.document
         : null;
-    if (foto) return await deImagen(m.chat.id, foto, m.caption || "");
-    if (/^\/(s|senal|señal)\b/i.test(texto)) return await deTexto(m.chat.id, texto);
+
+    if (foto) {
+      return await deImagen(m.chat.id, foto, m.caption || "");
+    }
+
+    if (/^\/(s|senal|señal)\b/i.test(texto)) {
+      return await deTexto(m.chat.id, texto);
+    }
+
     await enviar(m.chat.id, AYUDA);
+
   } catch (e) {
-    if (dueño) await enviar(dueño, `No pude armar la señal: ${e.message}`).catch(() => {});
+    if (dueño) {
+      await enviar(dueño, `No pude armar la señal: ${e.message}`).catch(() => {});
+    }
   }
 }
 
 async function deImagen(chat, foto, caption) {
-  await tg("sendChatAction", { chat_id: chat, action: "typing" }).catch(() => {});
-  const f = await tg("getFile", { file_id: foto.file_id });
-  const resp = await fetch(`https://api.telegram.org/file/bot\( {process.env.TELEGRAM_BOT_TOKEN}/ \){f.file_path}`);
-  if (!resp.ok) throw new Error("No pude bajar la imagen de Telegram");
+  await tg("sendChatAction", {
+    chat_id: chat,
+    action: "typing",
+  }).catch(() => {});
+
+  const f = await tg("getFile", {
+    file_id: foto.file_id,
+  });
+
+  const resp = await fetch(
+    `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${f.file_path}`
+  );
+
+  if (!resp.ok) {
+    throw new Error("No pude bajar la imagen de Telegram");
+  }
+
   const buf = await resp.arrayBuffer();
   const mime = /\.png$/i.test(f.file_path) ? "image/png" : "image/jpeg";
+
   const lectura = await leerGrafico(aBase64(buf), mime);
   const ajustes = leerCaption(caption);
+
   await entregar(chat, armarSenal(lectura, ajustes), lectura);
 }
 
 async function deTexto(chat, texto) {
   const p = leerManual(texto);
+
   if (!p.direccion || p.nums.length < 3) {
-    throw new Error("Formato: /s buy 4043 4039 4054 (dirección, entrada, stop loss y TP1; TP2 y TP3 opcionales)");
+    throw new Error(
+      "Formato: /s buy 4043 4039 4054 (dirección, entrada, stop loss y TP1; TP2 y TP3 opcionales)"
+    );
   }
+
   const [entrada, sl, tp1, tp2, tp3] = p.nums;
+
   const lectura = {
     instrumento: p.instrumento || "",
     direccion: p.direccion,
@@ -159,24 +221,40 @@ async function deTexto(chat, texto) {
     varias_posiciones: false,
     observaciones: "",
   };
+
   const err = validar(lectura);
-  if (err) throw new Error(err);
+
+  if (err) {
+    throw new Error(err);
+  }
+
   await entregar(chat, armarSenal(lectura, { estado: p.estado }), lectura);
 }
 
 async function entregar(chat, senal, lectura) {
   const aviso = [];
-  if (lectura.varias_posiciones) aviso.push("Había más de una posición en la imagen: usé la más reciente.");
-  if (lectura.observaciones) aviso.push(`Nota de la lectura: ${lectura.observaciones}`);
-  const resumen = `Lectura: ${senal.direccion} \( {senal.instrumento}\n \){senal.detalle}${aviso.length ? "\n" + aviso.join("\n") : ""}`;
+
+  if (lectura.varias_posiciones) {
+    aviso.push("Había más de una posición en la imagen: usé la más reciente.");
+  }
+
+  if (lectura.observaciones) {
+    aviso.push(`Nota de la lectura: ${lectura.observaciones}`);
+  }
+
+  const resumen = `Lectura: ${senal.direccion} ${senal.instrumento}\n${senal.detalle}${aviso.length ? "\n" + aviso.join("\n") : ""}`;
 
   if ((process.env.MODO || "confirmar").toLowerCase() === "auto") {
     const res = await publicar(senal.texto);
-    await enviar(chat, `\( {resumen}\n\n \){senal.texto}`);
+
+    await enviar(chat, `${resumen}\n\n${senal.texto}`);
     await enviar(chat, resultadoTexto(res));
+
     return;
   }
+
   await enviar(chat, resumen);
+
   await enviar(chat, senal.texto, {
     reply_markup: {
       inline_keyboard: [[
@@ -190,99 +268,199 @@ async function entregar(chat, senal, lectura) {
 const yaPublicados = new Set();
 
 async function alTocarBoton(cb, dueño) {
-  const responder = (t) => tg("answerCallbackQuery", { callback_query_id: cb.id, text: t }).catch(() => {});
-  if (String(cb.from.id) !== dueño || !cb.message) return responder("No autorizado");
+  const responder = (t) =>
+    tg("answerCallbackQuery", {
+      callback_query_id: cb.id,
+      text: t,
+    }).catch(() => {});
+
+  if (String(cb.from.id) !== dueño || !cb.message) {
+    return responder("No autorizado");
+  }
+
   const chat = cb.message.chat.id;
   const mid = cb.message.message_id;
+
   const quitarBotones = () =>
-    tg("editMessageReplyMarkup", { chat_id: chat, message_id: mid, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+    tg("editMessageReplyMarkup", {
+      chat_id: chat,
+      message_id: mid,
+      reply_markup: { inline_keyboard: [] },
+    }).catch(() => {});
 
   if (cb.data === "cancel") {
     await responder("Cancelada");
     await quitarBotones();
     return;
   }
-  if (cb.data !== "pub") return responder("");
+
+  if (cb.data !== "pub") {
+    return responder("");
+  }
+
   const texto = cb.message.text || "";
-  if (!texto.startsWith(TITULO)) return responder("Mensaje no válido");
-  const clave = `\( {chat}: \){mid}`;
-  if (yaPublicados.has(clave)) return responder("Ya se publicó");
+
+  if (!texto.startsWith(TITULO)) {
+    return responder("Mensaje no válido");
+  }
+
+  const clave = `${chat}:${mid}`;
+
+  if (yaPublicados.has(clave)) {
+    return responder("Ya se publicó");
+  }
+
   yaPublicados.add(clave);
+
   await responder("Publicando...");
   await quitarBotones();
+
   const res = await publicar(texto);
+
   await enviar(chat, resultadoTexto(res));
 }
 
 const resultadoTexto = (res) =>
-  res.map(([dest, ok, err]) => (ok ? `\( {dest}: publicada` : ` \){dest}: ERROR (${err})`)).join("\n");
+  res
+    .map(([dest, ok, err]) =>
+      ok ? `${dest}: publicada` : `${dest}: ERROR (${err})`
+    )
+    .join("\n");
 
 async function publicar(texto) {
   const res = [];
-  const chats = String(process.env.VIP_WHATSAPP_CHAT_ID || "").split(/[,\s;]+/).filter(Boolean);
+
+  const chats = String(process.env.VIP_WHATSAPP_CHAT_ID || "")
+    .split(/[,\s;]+/)
+    .filter(Boolean);
+
   if (process.env.GREENAPI_ID && process.env.GREENAPI_TOKEN && chats.length) {
-    const base = String(process.env.GREENAPI_URL || "https://api.green-api.com").replace(/\/+$/, "");
+    const base = String(
+      process.env.GREENAPI_URL || "https://api.green-api.com"
+    ).replace(/\/+$/, "");
+
     for (const chatId of chats) {
       try {
-        const r = await fetch(`\( {base}/waInstance \){process.env.GREENAPI_ID}/sendMessage/${process.env.GREENAPI_TOKEN}`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ chatId, message: texto }),
-        });
+        const r = await fetch(
+          `${base}/waInstance${process.env.GREENAPI_ID}/sendMessage/${process.env.GREENAPI_TOKEN}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              chatId,
+              message: texto,
+            }),
+          }
+        );
+
         const j = await r.json().catch(() => ({}));
-        if (!r.ok || !j.idMessage) throw new Error(`Green API ${r.status}`);
+
+        if (!r.ok || !j.idMessage) {
+          throw new Error(`Green API ${r.status}`);
+        }
+
         res.push(["WhatsApp Señales VIP", true]);
+
       } catch (e) {
         res.push(["WhatsApp Señales VIP", false, e.message]);
       }
     }
   }
+
   if (process.env.TELEGRAM_VIP_CHAT_ID) {
     try {
-      await enviar(process.env.TELEGRAM_VIP_CHAT_ID, aHtml(texto), { parse_mode: "HTML" });
+      await enviar(
+        process.env.TELEGRAM_VIP_CHAT_ID,
+        aHtml(texto),
+        { parse_mode: "HTML" }
+      );
+
       res.push(["Telegram VIP", true]);
+
     } catch (e) {
       res.push(["Telegram VIP", false, e.message]);
     }
   }
-  if (!res.length) throw new Error("No hay destinos configurados (VIP_WHATSAPP_CHAT_ID / TELEGRAM_VIP_CHAT_ID)");
+
+  if (!res.length) {
+    throw new Error(
+      "No hay destinos configurados (VIP_WHATSAPP_CHAT_ID / TELEGRAM_VIP_CHAT_ID)"
+    );
+  }
+
   return res;
 }
 
 function aBase64(buf) {
   const bytes = new Uint8Array(buf);
   let s = "";
-  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    s += String.fromCharCode.apply(
+      null,
+      bytes.subarray(i, i + 0x8000)
+    );
+  }
+
   return btoa(s);
 }
 
 async function gemini(modelo, b64, mime) {
   const cuerpo = JSON.stringify({
-    contents: [{ role: "user", parts: [{ text: PROMPT }, { inline_data: { mime_type: mime, data: b64 } }] }],
-    generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 1024 },
+    contents: [{
+      role: "user",
+      parts: [
+        { text: PROMPT },
+        {
+          inline_data: {
+            mime_type: mime,
+            data: b64,
+          },
+        },
+      ],
+    }],
+    generationConfig: {
+      responseMimeType: "application/json",
+      temperature: 0,
+      maxOutputTokens: 1024,
+    },
   });
+
   for (let intento = 0; intento < 2; intento++) {
-    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-goog-api-key": process.env.GEMINI_API_KEY },
-      body: cuerpo,
-    });
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-goog-api-key": process.env.GEMINI_API_KEY,
+        },
+        body: cuerpo,
+      }
+    );
+
     if (r.ok) {
       const j = await r.json();
       const partes = j.candidates?.[0]?.content?.parts || [];
       const texto = partes.map((p) => p.text || "").join("");
+
       try {
         return JSON.parse(texto);
       } catch {
         throw new Error("Gemini no devolvió JSON válido");
       }
     }
-    if (r.status === 429 || r.status >= 500) await new Promise((r) => setTimeout(r, 1200 * (intento + 1)));
-    else {
+
+    if (r.status === 429 || r.status >= 500) {
+      await new Promise((r) =>
+        setTimeout(r, 1200 * (intento + 1))
+      );
+    } else {
       const err = await r.text().catch(() => "");
       throw new Error(`Gemini ${r.status}: ${err.slice(0, 200)}`);
     }
   }
+
   throw new Error("Gemini falló después de reintentos");
 }
 
@@ -291,7 +469,9 @@ async function leerGrafico(b64, mime) {
     process.env.GEMINI_MODEL || "gemini-2.0-flash",
     process.env.GEMINI_MODEL_2 || "gemini-1.5-flash",
   ];
+
   let ultimoError;
+
   for (const m of modelos) {
     try {
       return await gemini(m, b64, mime);
@@ -299,47 +479,80 @@ async function leerGrafico(b64, mime) {
       ultimoError = e;
     }
   }
+
   throw ultimoError || new Error("No pude leer el gráfico");
 }
 
 function num(v) {
   if (v == null || v === "") return null;
+
   if (typeof v === "number") return v;
+
   const s = String(v).trim().replace(",", ".");
   const n = parseFloat(s);
+
   return Number.isFinite(n) ? n : null;
 }
 
 function validar(l) {
   const dir = (l.direccion || "").toUpperCase();
-  if (dir !== "BUY" && dir !== "SELL") return "Dirección inválida";
+
+  if (dir !== "BUY" && dir !== "SELL") {
+    return "Dirección inválida";
+  }
+
   const entrada = num(l.entrada);
   const sl = num(l.stop_loss);
   const tp1 = num(l.take_profit_1);
-  if (entrada == null || sl == null || tp1 == null) return "Faltan entrada, SL o TP1";
-  if (dir === "BUY" && !(sl < entrada && entrada < tp1)) return "Para BUY debe ser SL < Entrada < TP";
-  if (dir === "SELL" && !(tp1 < entrada && entrada < sl)) return "Para SELL debe ser TP < Entrada < SL";
+
+  if (entrada == null || sl == null || tp1 == null) {
+    return "Faltan entrada, SL o TP1";
+  }
+
+  if (dir === "BUY" && !(sl < entrada && entrada < tp1)) {
+    return "Para BUY debe ser SL < Entrada < TP";
+  }
+
+  if (dir === "SELL" && !(tp1 < entrada && entrada < sl)) {
+    return "Para SELL debe ser TP < Entrada < SL";
+  }
+
   return null;
 }
 
 function fmt(n) {
   if (n == null) return "";
+
   const d = process.env.DECIMALES;
-  if (d && d !== "auto") return Number(n).toFixed(Number(d));
+
+  if (d && d !== "auto") {
+    return Number(n).toFixed(Number(d));
+  }
+
   return String(n);
 }
 
 function armarSenal(lectura, ajustes = {}) {
   const dir = (lectura.direccion || "").toUpperCase();
-  const instrumento = (ajustes.instrumento || lectura.instrumento || process.env.INSTRUMENTO_DEFECTO || "XAUUSD").toUpperCase();
+
+  const instrumento = (
+    ajustes.instrumento ||
+    lectura.instrumento ||
+    process.env.INSTRUMENTO_DEFECTO ||
+    "XAUUSD"
+  ).toUpperCase();
+
   const entrada = num(lectura.entrada);
   const sl = num(lectura.stop_loss);
   const tp1 = num(lectura.take_profit_1);
-  const tp2 = num(lectura.take_profit_2);
-  const tp3 = num(lectura.take_profit_3);
+  const tp2 = num(ajustes.tp2 ?? lectura.take_profit_2);
+  const tp3 = num(ajustes.tp3 ?? lectura.take_profit_3);
 
   let estado = (ajustes.estado || "LIMIT PENDIENTE").toUpperCase();
-  if (ajustes.estado === "mercado") estado = "ACTIVA";
+
+  if (ajustes.estado === "mercado") {
+    estado = "ACTIVA";
+  }
 
   let texto = `${TITULO}\n\n`;
   texto += `Instrumento: ${instrumento}\n`;
@@ -347,44 +560,76 @@ function armarSenal(lectura, ajustes = {}) {
   texto += `Entrada: ${fmt(entrada)}\n`;
   texto += `Stop Loss: ${fmt(sl)}\n`;
   texto += `Take Profit : ${fmt(tp1)}`;
-  if (tp2 != null) texto += `\nTake Profit 2: ${fmt(tp2)}`;
-  if (tp3 != null) texto += `\nTake Profit 3: ${fmt(tp3)}`;
+
+  if (tp2 != null) {
+    texto += `\nTake Profit 2: ${fmt(tp2)}`;
+  }
+
+  if (tp3 != null) {
+    texto += `\nTake Profit 3: ${fmt(tp3)}`;
+  }
+
   texto += `\n\nESTADO: ${estado}\n\n`;
-  texto += `\( {AVISO_RIESGO}\n\n \){AVISO_SL}\n\n${FIRMA}`;
+  texto += `${AVISO_RIESGO}\n\n${AVISO_SL}\n\n${FIRMA}`;
 
   const detalle = `Entrada ${fmt(entrada)} | SL ${fmt(sl)} | TP ${fmt(tp1)}`;
-  return { texto, direccion: dir, instrumento, detalle };
+
+  return {
+    texto,
+    direccion: dir,
+    instrumento,
+    detalle,
+  };
 }
 
 function leerCaption(caption) {
   const t = (caption || "").toLowerCase();
   const out = {};
+
   const mTp2 = t.match(/tp2\s*[:=]?\s*([\d.,]+)/i);
   const mTp3 = t.match(/tp3\s*[:=]?\s*([\d.,]+)/i);
+
   if (mTp2) out.tp2 = mTp2[1];
   if (mTp3) out.tp3 = mTp3[1];
+
   if (/\bmercado\b/.test(t)) out.estado = "mercado";
   if (/\blimit\b/.test(t)) out.estado = "LIMIT PENDIENTE";
   if (/\bstop\b/.test(t)) out.estado = "STOP";
+
   const mInst = t.match(/\b([A-Z]{3,10}(?:USD|USDT|JPY|EUR|GBP)?)\b/i);
-  if (mInst) out.instrumento = mInst[1].toUpperCase();
+
+  if (mInst) {
+    out.instrumento = mInst[1].toUpperCase();
+  }
+
   return out;
 }
 
 function leerManual(texto) {
   const partes = texto.trim().split(/\s+/);
-  const out = { nums: [], estado: "LIMIT PENDIENTE" };
+  const out = {
+    nums: [],
+    estado: "LIMIT PENDIENTE",
+  };
+
   for (const p of partes.slice(1)) {
     const low = p.toLowerCase();
-    if (low === "buy" || low === "sell") out.direccion = low.toUpperCase();
-    else if (low === "mercado") out.estado = "mercado";
-    else if (low === "limit") out.estado = "LIMIT PENDIENTE";
-    else if (low === "stop") out.estado = "STOP";
-    else if (/^[A-Za-z]{3,10}$/.test(p)) out.instrumento = p.toUpperCase();
-    else {
+
+    if (low === "buy" || low === "sell") {
+      out.direccion = low.toUpperCase();
+    } else if (low === "mercado") {
+      out.estado = "mercado";
+    } else if (low === "limit") {
+      out.estado = "LIMIT PENDIENTE";
+    } else if (low === "stop") {
+      out.estado = "STOP";
+    } else if (/^[A-Za-z]{3,10}$/.test(p)) {
+      out.instrumento = p.toUpperCase();
+    } else {
       const n = num(p);
       if (n != null) out.nums.push(n);
     }
   }
+
   return out;
 }
