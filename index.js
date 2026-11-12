@@ -71,7 +71,7 @@ async function setup(req, res) {
     return res.status(403).send("forbidden");
   }
 
-  const url = `${req.protocol}://${req.get("host")}/telegram`;
+ const url = `https://${req.get("host")}/telegram`;
 
   try {
     const r = await tg("setWebhook", {
