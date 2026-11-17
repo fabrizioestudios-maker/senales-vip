@@ -40,7 +40,7 @@ GBPUSD (cambia el instrumento)
 Sin imagen:
 /s buy 4043 4039 4054
 /s sell 4026 4031 4016 4010 mercado
-(dirección, entrada, stop loss, TP1 y, si querés, TP2 y TP3)`;
+(dirección, entrada, stop loss, TP1 y, si querés, TP2 y TP3)\n\n/grupos (lista tus grupos de WhatsApp con su ID)`;
 
 const PORT = process.env.PORT || 3000;
 
@@ -246,6 +246,10 @@ async function procesar(update) {
       return await deImagen(m.chat.id, foto, m.caption || "");
     }
 
+    if (/^\/grupos\b/i.test(texto)) {
+      return await listarGrupos(m.chat.id);
+    }
+
     if (/^\/(s|senal|señal)\b/i.test(texto)) {
       return await deTexto(m.chat.id, texto);
     }
@@ -422,38 +426,41 @@ const resultadoTexto = (res) =>
     )
     .join("\n");
 
-async function publicar(texto) {
-  const res = [];
+const waBase = () =>
+  String(process.env.GREENAPI_URL || "https://api.green-api.com").replace(/\/+$/, "");
 
-  const chats = String(process.env.VIP_WHATSAPP_CHAT_ID || "")
+const waListo = () => Boolean(process.env.GREENAPI_ID && process.env.GREENAPI_TOKEN);
+
+const listaChats = (variable) =>
+  String(process.env[variable] || "")
     .split(/[,\s;]+/)
     .filter(Boolean);
 
-  if (process.env.GREENAPI_ID && process.env.GREENAPI_TOKEN && chats.length) {
-    const base = String(
-      process.env.GREENAPI_URL || "https://api.green-api.com"
-    ).replace(/\/+$/, "");
+async function waEnviar(chatId, texto) {
+  const r = await fetch(
+    `${waBase()}/waInstance${process.env.GREENAPI_ID}/sendMessage/${process.env.GREENAPI_TOKEN}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chatId, message: texto }),
+    }
+  );
 
-    for (const chatId of chats) {
+  const j = await r.json().catch(() => ({}));
+
+  if (!r.ok || !j.idMessage) {
+    throw new Error(`Green API ${r.status}`);
+  }
+}
+
+async function publicar(texto) {
+  const res = [];
+
+  // --- Señal completa: grupo Señales VIP (WhatsApp) ---
+  if (waListo()) {
+    for (const chatId of listaChats("VIP_WHATSAPP_CHAT_ID")) {
       try {
-        const r = await fetch(
-          `${base}/waInstance${process.env.GREENAPI_ID}/sendMessage/${process.env.GREENAPI_TOKEN}`,
-          {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              chatId,
-              message: texto,
-            }),
-          }
-        );
-
-        const j = await r.json().catch(() => ({}));
-
-        if (!r.ok || !j.idMessage) {
-          throw new Error(`Green API ${r.status}`);
-        }
-
+        await waEnviar(chatId, texto);
         res.push(["WhatsApp Señales VIP", true]);
       } catch (e) {
         res.push(["WhatsApp Señales VIP", false, e.message]);
@@ -461,6 +468,7 @@ async function publicar(texto) {
     }
   }
 
+  // --- Señal completa: Telegram VIP ---
   if (process.env.TELEGRAM_VIP_CHAT_ID) {
     try {
       await enviar(
@@ -481,7 +489,72 @@ async function publicar(texto) {
     );
   }
 
+  // --- Aviso SIN precios en el grupo de Avisos (WA_AVISOS_CHAT_ID) ---
+  // Solo si la señal salió en algún destino. Se desactiva con AVISO_SENAL=0.
+  if (waListo() && process.env.AVISO_SENAL !== "0" && res.some(([, ok]) => ok)) {
+    const avisos = listaChats("WA_AVISOS_CHAT_ID");
+
+    if (avisos.length) {
+      const inst = (texto.match(/Instrumento:\s*(\S+)/) || [])[1] || "";
+
+      const aviso =
+        `🚨 *Nueva señal publicada en SEÑALES VIP*\n\n` +
+        (inst ? `Instrumento: ${inst}\n\n` : "") +
+        `Los niveles de entrada, Stop Loss y Take Profit son solo para miembros del grupo VIP.\n\n` +
+        FIRMA;
+
+      for (const chatId of avisos) {
+        try {
+          await waEnviar(chatId, aviso);
+          res.push(["WhatsApp Avisos", true]);
+        } catch (e) {
+          res.push(["WhatsApp Avisos", false, e.message]);
+        }
+      }
+    }
+  }
+
   return res;
+}
+
+// /grupos: lista tus grupos de WhatsApp con su ID, para cargarlos en las variables.
+async function listarGrupos(chat) {
+  if (!waListo()) {
+    throw new Error("Faltan GREENAPI_ID / GREENAPI_TOKEN");
+  }
+
+  const r = await fetch(
+    `${waBase()}/waInstance${process.env.GREENAPI_ID}/getContacts/${process.env.GREENAPI_TOKEN}`
+  );
+
+  const j = await r.json().catch(() => null);
+
+  if (!r.ok || !Array.isArray(j)) {
+    throw new Error(`Green API getContacts ${r.status}`);
+  }
+
+  const grupos = j.filter((c) => String(c.id || "").endsWith("@g.us"));
+
+  if (!grupos.length) {
+    await enviar(chat, "No encontré grupos en la cuenta de WhatsApp conectada.");
+    return;
+  }
+
+  const bloques = grupos.map((g) => `${g.name || "(sin nombre)"}\n${g.id}`);
+
+  // Telegram admite hasta 4096 caracteres por mensaje.
+  let actual = "Grupos de WhatsApp (nombre e ID):\n";
+
+  for (const b of bloques) {
+    if ((actual + "\n" + b).length > 3500) {
+      await enviar(chat, actual);
+      actual = "";
+    }
+
+    actual += (actual ? "\n" : "") + b + "\n";
+  }
+
+  if (actual.trim()) await enviar(chat, actual);
 }
 
 function aBase64(buf) {
