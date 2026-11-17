@@ -44,6 +44,16 @@ Sin imagen:
 
 const PORT = process.env.PORT || 3000;
 
+// Publicación automática de las señales que genera el bot solo
+// (alertas de TradingView y señales por velas). Las fotos y /s siguen
+// el valor de MODO (confirmar por defecto).
+const autoTV = () =>
+  ["1", "true", "si", "sí", "on"].includes(String(process.env.AUTO_TV || "").toLowerCase());
+
+// Estado por defecto de las señales automáticas: la entrada ya se tocó
+// cuando se dispara la señal, por eso sale como ACTIVA.
+const estadoAuto = () => process.env.ESTADO_TV || "mercado";
+
 app.get("/", (req, res) => res.send("Bot de señales activo"));
 app.get("/setup", setup);
 
@@ -96,11 +106,17 @@ app.post("/tradingview", express.text({ type: "*/*", limit: "100kb" }), async (r
 
     const clave = [lectura.instrumento, d.tf, lectura.direccion, lectura.entrada, lectura.stop_loss].join("|");
     const ahora = Date.now();
+
+    // Limpia entradas viejas para que el Map no crezca sin límite.
+    for (const [k, t] of tvRecientes) {
+      if (ahora - t > 600000) tvRecientes.delete(k);
+    }
+
     if (ahora - (tvRecientes.get(clave) || 0) < 120000) return;
     tvRecientes.set(clave, ahora);
 
-    const senal = armarSenal(lectura, { estado: process.env.ESTADO_TV });
-    await entregar(dueño, senal, lectura);
+    const senal = armarSenal(lectura, { estado: estadoAuto(), origen: "automática" });
+    await entregar(dueño, senal, lectura, autoTV());
   } catch (e) {
     console.error(e);
     if (dueño) {
@@ -126,7 +142,7 @@ app.get("/tradingview/test", async (req, res) => {
   };
 
   try {
-    await enviar(String(process.env.OWNER_ID || ""), armarSenal(l, { estado: process.env.ESTADO_TV }).texto);
+    await enviar(String(process.env.OWNER_ID || ""), armarSenal(l, { estado: estadoAuto(), origen: "automática" }).texto);
     res.send("Prueba enviada a tu Telegram");
   } catch (e) {
     res.status(500).send(e.message);
@@ -136,11 +152,14 @@ app.get("/tradingview/test", async (req, res) => {
 app.listen(PORT, () => console.log(`Bot escuchando en puerto ${PORT}`));
 
 async function setup(req, res) {
-  if (!process.env.WEBHOOK_SECRET || req.query.key !== process.env.WEBHOOK_SECRET) {
+  // Clave propia para /setup (SETUP_KEY). Si no existe, usa WEBHOOK_SECRET como antes.
+  const claveSetup = process.env.SETUP_KEY || process.env.WEBHOOK_SECRET;
+
+  if (!process.env.WEBHOOK_SECRET || !claveSetup || req.query.key !== claveSetup) {
     return res.status(403).send("forbidden");
   }
 
- const url = `https://${req.get("host")}/telegram`;
+  const url = `https://${req.get("host")}/telegram`;
 
   try {
     const r = await tg("setWebhook", {
@@ -232,7 +251,6 @@ async function procesar(update) {
     }
 
     await enviar(m.chat.id, AYUDA);
-
   } catch (e) {
     if (dueño) {
       await enviar(dueño, `No pude armar la señal: ${e.message}`).catch(() => {});
@@ -264,7 +282,7 @@ async function deImagen(chat, foto, caption) {
   const lectura = await leerGrafico(aBase64(buf), mime);
   const ajustes = leerCaption(caption);
 
-  await entregar(chat, armarSenal(lectura, ajustes), lectura);
+  await entregar(chat, armarSenal(lectura, { ...ajustes, origen: "manual" }), lectura);
 }
 
 async function deTexto(chat, texto) {
@@ -297,10 +315,11 @@ async function deTexto(chat, texto) {
     throw new Error(err);
   }
 
-  await entregar(chat, armarSenal(lectura, { estado: p.estado }), lectura);
+  await entregar(chat, armarSenal(lectura, { estado: p.estado, origen: "manual" }), lectura);
 }
 
-async function entregar(chat, senal, lectura) {
+// forzarAuto = true publica directo en los canales VIP sin pedir confirmación.
+async function entregar(chat, senal, lectura, forzarAuto = false) {
   const aviso = [];
 
   if (lectura.varias_posiciones) {
@@ -313,11 +332,18 @@ async function entregar(chat, senal, lectura) {
 
   const resumen = `Lectura: ${senal.direccion} ${senal.instrumento}\n${senal.detalle}${aviso.length ? "\n" + aviso.join("\n") : ""}`;
 
-  if ((process.env.MODO || "confirmar").toLowerCase() === "auto") {
-    const res = await publicar(senal.texto);
+  if (forzarAuto || (process.env.MODO || "confirmar").toLowerCase() === "auto") {
+    let resultado;
 
+    try {
+      resultado = resultadoTexto(await publicar(senal.texto));
+    } catch (e) {
+      resultado = `No se pudo publicar: ${e.message}`;
+    }
+
+    // Copia para el dueño: siempre llega, aunque la publicación falle.
     await enviar(chat, `${resumen}\n\n${senal.texto}`);
-    await enviar(chat, resultadoTexto(res));
+    await enviar(chat, resultado);
 
     return;
   }
@@ -429,7 +455,6 @@ async function publicar(texto) {
         }
 
         res.push(["WhatsApp Señales VIP", true]);
-
       } catch (e) {
         res.push(["WhatsApp Señales VIP", false, e.message]);
       }
@@ -445,7 +470,6 @@ async function publicar(texto) {
       );
 
       res.push(["Telegram VIP", true]);
-
     } catch (e) {
       res.push(["Telegram VIP", false, e.message]);
     }
@@ -491,7 +515,9 @@ async function gemini(modelo, b64, mime) {
     generationConfig: {
       responseMimeType: "application/json",
       temperature: 0,
-      maxOutputTokens: 1024,
+      // Margen amplio: los modelos nuevos pueden gastar tokens pensando
+      // y cortar el JSON si el límite es muy bajo.
+      maxOutputTokens: 4096,
     },
   });
 
@@ -521,12 +547,10 @@ async function gemini(modelo, b64, mime) {
     }
 
     if (r.status === 429 || r.status >= 500) {
-      await new Promise((r) =>
-        setTimeout(r, 1200 * (intento + 1))
-      );
+      await new Promise((ok) => setTimeout(ok, 1200 * (intento + 1)));
     } else {
       const err = await r.text().catch(() => "");
-      throw new Error(`Gemini ${r.status}: ${err.slice(0, 200)}`);
+      throw new Error(`Gemini ${modelo} ${r.status}: ${err.slice(0, 200)}`);
     }
   }
 
@@ -534,9 +558,11 @@ async function gemini(modelo, b64, mime) {
 }
 
 async function leerGrafico(b64, mime) {
+  // gemini-2.0-flash y gemini-1.5-flash ya fueron dados de baja por Google.
+  // Si algún modelo cambia de nombre, se ajusta con GEMINI_MODEL / GEMINI_MODEL_2 en Railway.
   const modelos = [
-    process.env.GEMINI_MODEL || "gemini-2.0-flash",
-    process.env.GEMINI_MODEL_2 || "gemini-1.5-flash",
+    process.env.GEMINI_MODEL || "gemini-3.8-flash",
+    process.env.GEMINI_MODEL_2 || "gemini-3.6-flash",
   ];
 
   let ultimoError;
@@ -619,11 +645,17 @@ function armarSenal(lectura, ajustes = {}) {
 
   let estado = (ajustes.estado || "LIMIT PENDIENTE").toUpperCase();
 
-  if (ajustes.estado === "mercado") {
+  if (String(ajustes.estado || "").toLowerCase() === "mercado") {
     estado = "ACTIVA";
   }
 
+  // Tipo de señal: AUTOMÁTICA (la genera el bot) o MANUAL (la mandás vos).
+  const origen = String(ajustes.origen || "").toUpperCase();
+
   let texto = `${TITULO}\n\n`;
+  if (origen) {
+    texto += `Tipo de señal: ${origen}\n`;
+  }
   texto += `Instrumento: ${instrumento}\n`;
   texto += `Operación:  ${dir}\n`;
   texto += `Entrada: ${fmt(entrada)}\n`;
@@ -663,9 +695,14 @@ function leerCaption(caption) {
 
   if (/\bmercado\b/.test(t)) out.estado = "mercado";
   if (/\blimit\b/.test(t)) out.estado = "LIMIT PENDIENTE";
-  if (/\bstop\b/.test(t)) out.estado = "STOP";
+  // "stop" solo cuenta como tipo de orden; "stop loss" no cambia el estado.
+  if (/\bstop\b(?!\s*loss)/.test(t)) out.estado = "STOP";
 
-  const mInst = t.match(/\b([A-Z]{3,10}(?:USD|USDT|JPY|EUR|GBP)?)\b/i);
+  // Instrumento: solo símbolos reales, no cualquier palabra del texto
+  // (antes "mercado" o "limit" terminaban como instrumento).
+  const mInst = t.match(
+    /\b(x(?:au|ag)usd|[a-z]{3,4}usdt?|[a-z]{3}(?:jpy|eur|gbp|chf|cad|aud|nzd)|us30|us100|us500|nas100|spx500|ger40|dxy)\b/i
+  );
 
   if (mInst) {
     out.instrumento = mInst[1].toUpperCase();
@@ -706,7 +743,6 @@ function leerManual(texto) {
 // =====================================================================
 // SEÑALES AUTOMÁTICAS POR VELAS (sin webhook de TradingView)
 // Porta la lógica de señales de Bias Toolkit V.2.
-// Pegar AL FINAL de index.js, después de leerManual().
 // =====================================================================
 
 const TV_INTERVALOS = {
@@ -1134,30 +1170,53 @@ async function revisarVelas() {
     const nuevas = senales.filter((s) => s.t > tvUltimaVela);
     tvUltimaVela = ultimaT;
 
+    // Seguro para la publicación automática: si el bot estuvo sin datos un rato,
+    // no publica señales viejas. Edad máxima en minutos (TV_MAX_EDAD_MIN, 20 por defecto).
+    const maxEdadMin = Number(process.env.TV_MAX_EDAD_MIN || 20);
+
     for (const s of nuevas) {
-      const lectura = {
-        instrumento: "XAUUSD",
-        direccion: s.side,
-        entrada: s.entry,
-        stop_loss: s.sl,
-        take_profit_1: s.tp[0],
-        take_profit_2: s.tp[1],
-        take_profit_3: s.tp[2],
-        precio_actual: null,
-        varias_posiciones: false,
-        observaciones: `Automática ${intervalo}, ${s.tipo}, vela ${new Date(s.t)
-          .toISOString()
-          .slice(11, 16)} UTC`,
-      };
-
-      const err = validar(lectura);
-
-      if (err) {
-        console.error("Señal descartada:", err);
+      if (Number.isFinite(maxEdadMin) && ultimaT - s.t > maxEdadMin * 60000) {
+        console.error("Señal descartada por antigua:", new Date(s.t).toISOString());
         continue;
       }
 
-      await entregar(dueño, armarSenal(lectura, { estado: process.env.ESTADO_TV }), lectura);
+      try {
+        const lectura = {
+          instrumento: "XAUUSD",
+          direccion: s.side,
+          entrada: s.entry,
+          stop_loss: s.sl,
+          take_profit_1: s.tp[0],
+          take_profit_2: s.tp[1],
+          take_profit_3: s.tp[2],
+          precio_actual: null,
+          varias_posiciones: false,
+          observaciones: `Automática ${intervalo}, ${s.tipo}, vela ${new Date(s.t)
+            .toISOString()
+            .slice(11, 16)} UTC`,
+        };
+
+        const err = validar(lectura);
+
+        if (err) {
+          console.error("Señal descartada:", err);
+          continue;
+        }
+
+        await entregar(
+          dueño,
+          armarSenal(lectura, { estado: estadoAuto(), origen: "automática" }),
+          lectura,
+          autoTV()
+        );
+      } catch (e) {
+        // Un error en una señal no debe frenar las que siguen.
+        console.error("Error entregando señal:", e.message);
+
+        if (dueño) {
+          await enviar(dueño, `Señal automática no entregada: ${e.message}`).catch(() => {});
+        }
+      }
     }
   } catch (e) {
     console.error("Velas:", e.message);
@@ -1183,7 +1242,9 @@ function iniciarVelas() {
   setTimeout(revisarVelas, 5000);
   setInterval(revisarVelas, cada);
 
-  console.log(`Señales por velas activas (cada ${Math.round(cada / 1000)} s)`);
+  console.log(
+    `Señales por velas activas (cada ${Math.round(cada / 1000)} s, publicación automática: ${autoTV() ? "SÍ" : "no"})`
+  );
 }
 
 // Validación: lista las últimas señales que calcula el motor (hora UTC).
