@@ -702,3 +702,516 @@ function leerManual(texto) {
 
   return out;
 }
+
+// =====================================================================
+// SEÑALES AUTOMÁTICAS POR VELAS (sin webhook de TradingView)
+// Porta la lógica de señales de Bias Toolkit V.2.
+// Pegar AL FINAL de index.js, después de leerManual().
+// =====================================================================
+
+const TV_INTERVALOS = {
+  "1min": 60000,
+  "5min": 300000,
+  "15min": 900000,
+  "30min": 1800000,
+  "1h": 3600000,
+};
+
+function tvConfig() {
+  const n = (k, d) => {
+    const v = process.env[k];
+    return v !== undefined && v !== "" && Number.isFinite(Number(v)) ? Number(v) : d;
+  };
+
+  return {
+    swingLen: n("SWING_LEN", 12),
+    internalLen: n("INTERNAL_LEN", 4),
+    mintick: n("TV_MINTICK", 0.01),
+    decimales: n("TV_DECIMALES", 2),
+    zonaA: n("ZONA_1", 0.618),
+    zonaB: n("ZONA_2", 0.7),
+    solapePct: n("SOLAPE_PCT", 50),
+    slBuffer: n("SL_BUFFER", 0),
+    tp: [n("TP1_R", 1), n("TP2_R", 2), n("TP3_R", 3)],
+    mecha: String(process.env.BREAK_SOURCE || "Close").toLowerCase() === "wick",
+  };
+}
+
+function pivote(arr, i, len, alto) {
+  const c = i - len;
+  if (c - len < 0) return null;
+
+  const v = arr[c];
+
+  for (let k = 1; k <= len; k++) {
+    const izq = arr[c - k];
+    const der = arr[c + k];
+
+    if (alto ? izq > v || der >= v : izq < v || der <= v) return null;
+  }
+
+  return v;
+}
+
+function biasToolkit(velas, cfg) {
+  const z1 = Math.min(cfg.zonaA, cfg.zonaB);
+  const z2 = Math.max(cfg.zonaA, cfg.zonaB);
+  const altos = velas.map((v) => v.high);
+  const bajos = velas.map((v) => v.low);
+  const redondear = (x) => Number(x.toFixed(cfg.decimales));
+
+  let ultSPH = null, ultSPL = null, ultSPHBar = null, ultSPLBar = null;
+  let sHigh = null, sLow = null, sHighBar = null, sLowBar = null;
+  let sHighFija = false, sLowFija = false, sTrend = 0;
+
+  let ultIPH = null, ultIPL = null, ultIPHBar = null, ultIPLBar = null;
+  let iHigh = null, iLow = null, iHighBar = null, iLowBar = null;
+  let iHighFija = false, iLowFija = false, iTrend = 0;
+
+  let senalDisparada = false;
+  let confluenciaDisparada = false;
+
+  const salida = [];
+
+  for (let i = 0; i < velas.length; i++) {
+    const { open, high, low, close } = velas[i];
+
+    const sPH = pivote(altos, i, cfg.swingLen, true);
+    const sPL = pivote(bajos, i, cfg.swingLen, false);
+    const iPH = pivote(altos, i, cfg.internalLen, true);
+    const iPL = pivote(bajos, i, cfg.internalLen, false);
+
+    // --- Pivotes mayores ---
+    if (sPH !== null) {
+      ultSPH = sPH;
+      ultSPHBar = i - cfg.swingLen;
+
+      if (sTrend === 0) {
+        if (sHigh === null) {
+          sHigh = sPH;
+          sHighBar = ultSPHBar;
+          sHighFija = true;
+        }
+      } else if (sTrend === 1 && !sHighFija && sPH >= sHigh - cfg.mintick) {
+        sHigh = sPH;
+        sHighBar = ultSPHBar;
+        sHighFija = true;
+      }
+    }
+
+    if (sPL !== null) {
+      ultSPL = sPL;
+      ultSPLBar = i - cfg.swingLen;
+
+      if (sTrend === 0) {
+        if (sLow === null) {
+          sLow = sPL;
+          sLowBar = ultSPLBar;
+          sLowFija = true;
+        }
+      } else if (sTrend === -1 && !sLowFija && sPL <= sLow + cfg.mintick) {
+        sLow = sPL;
+        sLowBar = ultSPLBar;
+        sLowFija = true;
+      }
+    }
+
+    // --- Pivotes internos ---
+    if (iPH !== null) {
+      ultIPH = iPH;
+      ultIPHBar = i - cfg.internalLen;
+
+      if (iTrend === 0) {
+        if (iHigh === null) {
+          iHigh = iPH;
+          iHighBar = ultIPHBar;
+          iHighFija = true;
+        }
+      } else if (iTrend === 1 && !iHighFija && iPH >= iHigh - cfg.mintick) {
+        iHigh = iPH;
+        iHighBar = ultIPHBar;
+        iHighFija = true;
+      }
+    }
+
+    if (iPL !== null) {
+      ultIPL = iPL;
+      ultIPLBar = i - cfg.internalLen;
+
+      if (iTrend === 0) {
+        if (iLow === null) {
+          iLow = iPL;
+          iLowBar = ultIPLBar;
+          iLowFija = true;
+        }
+      } else if (iTrend === -1 && !iLowFija && iPL <= iLow + cfg.mintick) {
+        iLow = iPL;
+        iLowBar = ultIPLBar;
+        iLowFija = true;
+      }
+    }
+
+    // --- Rupturas ---
+    const fuenteSup = cfg.mecha ? high : close;
+    const fuenteInf = cfg.mecha ? low : close;
+
+    let sBull = sHigh !== null && fuenteSup > sHigh && (sTrend <= 0 || sHighFija);
+    let sBear = sLow !== null && fuenteInf < sLow && (sTrend >= 0 || sLowFija);
+    let iBull = iHigh !== null && fuenteSup > iHigh && (iTrend <= 0 || iHighFija);
+    let iBear = iLow !== null && fuenteInf < iLow && (iTrend >= 0 || iLowFija);
+
+    if (sBull && sBear) {
+      sBull = close >= open;
+      sBear = !sBull;
+    }
+
+    if (iBull && iBear) {
+      iBull = close >= open;
+      iBear = !iBull;
+    }
+
+    // --- Transiciones swing ---
+    if (sBull) {
+      sTrend = 1;
+
+      if (ultSPL !== null && ultSPLBar < i) {
+        sLow = ultSPL;
+        sLowBar = ultSPLBar;
+        sLowFija = true;
+      }
+
+      sHigh = high;
+      sHighBar = i;
+      sHighFija = false;
+      confluenciaDisparada = false;
+    }
+
+    if (sBear) {
+      sTrend = -1;
+
+      if (ultSPH !== null && ultSPHBar < i) {
+        sHigh = ultSPH;
+        sHighBar = ultSPHBar;
+        sHighFija = true;
+      }
+
+      sLow = low;
+      sLowBar = i;
+      sLowFija = false;
+      confluenciaDisparada = false;
+    }
+
+    if (sTrend === 1 && !sHighFija && (sHigh === null || high > sHigh)) {
+      sHigh = high;
+      sHighBar = i;
+      confluenciaDisparada = false;
+    }
+
+    if (sTrend === -1 && !sLowFija && (sLow === null || low < sLow)) {
+      sLow = low;
+      sLowBar = i;
+      confluenciaDisparada = false;
+    }
+
+    // --- Transiciones internas ---
+    if (iBull) {
+      iTrend = 1;
+
+      if (ultIPL !== null) {
+        iLow = ultIPL;
+        iLowBar = ultIPLBar;
+        iLowFija = true;
+      }
+
+      iHigh = high;
+      iHighBar = i;
+      iHighFija = false;
+      senalDisparada = false;
+      confluenciaDisparada = false;
+    }
+
+    if (iBear) {
+      iTrend = -1;
+
+      if (ultIPH !== null) {
+        iHigh = ultIPH;
+        iHighBar = ultIPHBar;
+        iHighFija = true;
+      }
+
+      iLow = low;
+      iLowBar = i;
+      iLowFija = false;
+      senalDisparada = false;
+      confluenciaDisparada = false;
+    }
+
+    if (iTrend === 1 && !iHighFija && (iHigh === null || high > iHigh)) {
+      iHigh = high;
+      iHighBar = i;
+      senalDisparada = false;
+      confluenciaDisparada = false;
+    }
+
+    if (iTrend === -1 && !iLowFija && (iLow === null || low < iLow)) {
+      iLow = low;
+      iLowBar = i;
+      senalDisparada = false;
+      confluenciaDisparada = false;
+    }
+
+    // --- Rangos y zonas ---
+    const validoI =
+      iHigh !== null && iLow !== null && iHighBar !== null && iLowBar !== null && iHigh > iLow;
+    const validoS =
+      sHigh !== null && sLow !== null && sHighBar !== null && sLowBar !== null && sHigh > sLow;
+
+    let iSegundo = null, iTop = null, iBot = null;
+    let sTop = null, sBot = null;
+
+    if (validoI && iTrend !== 0) {
+      const tam = iHigh - iLow;
+      const a = iTrend === 1 ? iHigh - tam * z1 : iLow + tam * z1;
+      const b = iTrend === 1 ? iHigh - tam * z2 : iLow + tam * z2;
+      iSegundo = b;
+      iTop = Math.max(a, b);
+      iBot = Math.min(a, b);
+    }
+
+    if (validoS && sTrend !== 0) {
+      const tam = sHigh - sLow;
+      const a = sTrend === 1 ? sHigh - tam * z1 : sLow + tam * z1;
+      const b = sTrend === 1 ? sHigh - tam * z2 : sLow + tam * z2;
+      sTop = Math.max(a, b);
+      sBot = Math.min(a, b);
+    }
+
+    // --- Señales ---
+    const swingMid = validoS ? (sHigh + sLow) / 2 : null;
+    const profundo = iSegundo;
+    const alineadas = sTrend !== 0 && sTrend === iTrend;
+    const alineadasBajista = sTrend === -1 && iTrend === -1;
+    const alineadasAlcista = sTrend === 1 && iTrend === 1;
+
+    const sellSignal =
+      !senalDisparada && alineadasBajista && profundo !== null && swingMid !== null &&
+      profundo > swingMid && high >= profundo;
+    const buySignal =
+      !senalDisparada && alineadasAlcista && profundo !== null && swingMid !== null &&
+      profundo < swingMid && low <= profundo;
+
+    let solapeInf = null, solapeSup = null, coinciden = false;
+
+    if (iTop !== null && sTop !== null) {
+      solapeInf = Math.max(sBot, iBot);
+      solapeSup = Math.min(sTop, iTop);
+      const solape = solapeSup - solapeInf;
+      const menor = Math.min(sTop - sBot, iTop - iBot);
+      coinciden = alineadas && solape >= 0 && solape >= (menor * cfg.solapePct) / 100;
+    }
+
+    const confSell = !confluenciaDisparada && coinciden && sTrend === -1 && high >= solapeInf;
+    const confBuy = !confluenciaDisparada && coinciden && sTrend === 1 && low <= solapeSup;
+
+    if (sellSignal || buySignal) senalDisparada = true;
+    if (confSell || confBuy) confluenciaDisparada = true;
+
+    const sellAny = sellSignal || confSell;
+    const buyAny = buySignal || confBuy;
+
+    const emitir = (side, entry, sl, tipo) => {
+      const riesgo = Math.abs(entry - sl);
+      const dir = side === "BUY" ? 1 : -1;
+
+      salida.push({
+        t: velas[i].t,
+        side,
+        tipo,
+        entry: redondear(entry),
+        sl: redondear(sl),
+        tp: cfg.tp.map((r) => redondear(entry + dir * riesgo * r)),
+      });
+    };
+
+    if (sellAny) {
+      const entry = sellSignal ? profundo : solapeInf;
+      const sl = iHigh !== null ? iHigh + cfg.slBuffer : null;
+
+      if (entry !== null && sl !== null && sl > entry) {
+        emitir("SELL", entry, sl, sellSignal ? "estructura" : "confluencia");
+      }
+    }
+
+    if (buyAny) {
+      const entry = buySignal ? profundo : solapeSup;
+      const sl = iLow !== null ? iLow - cfg.slBuffer : null;
+
+      if (entry !== null && sl !== null && sl < entry) {
+        emitir("BUY", entry, sl, buySignal ? "estructura" : "confluencia");
+      }
+    }
+  }
+
+  return salida;
+}
+
+async function traerVelas() {
+  const intervalo = process.env.TV_INTERVAL || "1min";
+  const ms = TV_INTERVALOS[intervalo];
+
+  if (!ms) throw new Error(`Intervalo no soportado: ${intervalo}`);
+  if (!process.env.TWELVEDATA_KEY) throw new Error("Falta TWELVEDATA_KEY");
+
+  const url = new URL("https://api.twelvedata.com/time_series");
+  url.searchParams.set("symbol", process.env.TV_SYMBOL || "XAU/USD");
+  url.searchParams.set("interval", intervalo);
+  url.searchParams.set("outputsize", process.env.TV_VELAS || "1500");
+  url.searchParams.set("timezone", "UTC");
+  url.searchParams.set("apikey", process.env.TWELVEDATA_KEY);
+
+  const r = await fetch(url);
+  const j = await r.json().catch(() => ({}));
+
+  if (!r.ok || j.status === "error" || !Array.isArray(j.values)) {
+    throw new Error(`Twelve Data: ${j.message || r.status}`);
+  }
+
+  const ahora = Date.now();
+
+  const velas = j.values
+    .map((v) => ({
+      t: Date.parse(String(v.datetime).replace(" ", "T") + "Z"),
+      open: parseFloat(v.open),
+      high: parseFloat(v.high),
+      low: parseFloat(v.low),
+      close: parseFloat(v.close),
+    }))
+    .filter((v) => Number.isFinite(v.t) && Number.isFinite(v.close))
+    .sort((a, b) => a.t - b.t)
+    .filter((v) => v.t + ms <= ahora); // descarta la vela en formación
+
+  return { velas, ms, intervalo };
+}
+
+function mercadoAbierto() {
+  const d = new Date();
+  const dia = d.getUTCDay();
+  const h = d.getUTCHours();
+
+  if (dia === 6) return false;
+  if (dia === 5 && h >= 22) return false;
+  if (dia === 0 && h < 22) return false;
+
+  return true;
+}
+
+let tvUltimaVela = null;
+let tvOcupado = false;
+let tvErrorAvisado = false;
+
+async function revisarVelas() {
+  if (tvOcupado || !mercadoAbierto()) return;
+
+  tvOcupado = true;
+  const dueño = String(process.env.OWNER_ID || "");
+
+  try {
+    const { velas, intervalo } = await traerVelas();
+
+    if (velas.length < 100) throw new Error("Pocas velas para calcular");
+
+    const senales = biasToolkit(velas, tvConfig());
+    const ultimaT = velas[velas.length - 1].t;
+
+    tvErrorAvisado = false;
+
+    // Primera corrida: solo fija el punto de partida, no manda el historial.
+    if (tvUltimaVela === null) {
+      tvUltimaVela = ultimaT;
+      return;
+    }
+
+    const nuevas = senales.filter((s) => s.t > tvUltimaVela);
+    tvUltimaVela = ultimaT;
+
+    for (const s of nuevas) {
+      const lectura = {
+        instrumento: "XAUUSD",
+        direccion: s.side,
+        entrada: s.entry,
+        stop_loss: s.sl,
+        take_profit_1: s.tp[0],
+        take_profit_2: s.tp[1],
+        take_profit_3: s.tp[2],
+        precio_actual: null,
+        varias_posiciones: false,
+        observaciones: `Automática ${intervalo}, ${s.tipo}, vela ${new Date(s.t)
+          .toISOString()
+          .slice(11, 16)} UTC`,
+      };
+
+      const err = validar(lectura);
+
+      if (err) {
+        console.error("Señal descartada:", err);
+        continue;
+      }
+
+      await entregar(dueño, armarSenal(lectura, { estado: process.env.ESTADO_TV }), lectura);
+    }
+  } catch (e) {
+    console.error("Velas:", e.message);
+
+    if (dueño && !tvErrorAvisado) {
+      tvErrorAvisado = true;
+      await enviar(dueño, `Señales automáticas: ${e.message}`).catch(() => {});
+    }
+  } finally {
+    tvOcupado = false;
+  }
+}
+
+function iniciarVelas() {
+  if (!process.env.TWELVEDATA_KEY) {
+    console.log("Señales por velas desactivadas (falta TWELVEDATA_KEY)");
+    return;
+  }
+
+  const ms = TV_INTERVALOS[process.env.TV_INTERVAL || "1min"] || 60000;
+  const cada = Math.max(ms, Number(process.env.TV_POLL_SEG || 120) * 1000);
+
+  setTimeout(revisarVelas, 5000);
+  setInterval(revisarVelas, cada);
+
+  console.log(`Señales por velas activas (cada ${Math.round(cada / 1000)} s)`);
+}
+
+// Validación: lista las últimas señales que calcula el motor (hora UTC).
+app.get("/velas/senales", async (req, res) => {
+  if (!process.env.TRADINGVIEW_KEY || req.query.key !== process.env.TRADINGVIEW_KEY) {
+    return res.status(403).send("forbidden");
+  }
+
+  try {
+    const { velas, intervalo } = await traerVelas();
+    const lista = biasToolkit(velas, tvConfig()).slice(-15);
+    const hora = (t) => new Date(t).toISOString().replace("T", " ").slice(0, 16);
+
+    const lineas = lista.map(
+      (x) =>
+        `${hora(x.t)} UTC | ${x.side} | ${x.tipo} | entrada ${x.entry} | SL ${x.sl} | TP ${x.tp.join(" / ")}`
+    );
+
+    res
+      .type("text/plain")
+      .send(
+        `Velas: ${velas.length} (${intervalo}) de ${hora(velas[0].t)} a ${hora(
+          velas[velas.length - 1].t
+        )} UTC\n\n` + (lineas.join("\n") || "Sin señales en el período")
+      );
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
+iniciarVelas();
