@@ -12,12 +12,13 @@ const FIRMA = "*Trading Institucional* 🏛📈";
 const PROMPT = `Sos un lector de capturas de TradingView (modo oscuro). En la captura hay dibujada la herramienta "posición larga/corta".
 
 La herramienta son DOS rectángulos apilados que comparten un borde horizontal, que es la ENTRADA:
-- un rectángulo marrón/naranja translúcido: la zona de ganancia (va hacia el take profit);
-- un rectángulo gris azulado: la zona de pérdida (va hacia el stop loss).
+- un rectángulo marrón/naranja translúcido (o verde, según el tema): la zona de ganancia (va hacia el take profit);
+- un rectángulo gris azulado (o rojo, según el tema): la zona de pérdida (va hacia el stop loss).
 Dirección:
-- marrón ARRIBA de la entrada y gris ABAJO = "BUY" (take profit arriba, stop loss abajo);
-- gris ARRIBA de la entrada y marrón ABAJO = "SELL" (stop loss arriba, take profit abajo).
-Niveles: el borde del rectángulo marrón que está más lejos de la entrada es el take_profit_1; el borde del gris más lejos de la entrada es el stop_loss; el borde que comparten es la entrada.
+- zona de ganancia ARRIBA de la entrada y zona de pérdida ABAJO = "BUY" (take profit arriba, stop loss abajo);
+- zona de pérdida ARRIBA de la entrada y zona de ganancia ABAJO = "SELL" (stop loss arriba, take profit abajo).
+- Los colores pueden estar invertidos o cambiados. NO te guíes por el color: si el stop loss está ARRIBA de la entrada es "SELL"; si está ABAJO es "BUY".
+Niveles: el borde del rectángulo de ganancia que está más lejos de la entrada es el take_profit_1; el borde del de pérdida más lejos de la entrada es el stop_loss; el borde que comparten es la entrada.
 
 Precios: cada nivel de la herramienta tiene pegada, junto a su borde derecho, una etiqueta gris redondeada con el precio (con un circulito). Usá exactamente esos valores. Si no se ven, leé el precio en la escala de la derecha según la posición vertical del borde. Ignorá las demás etiquetas de la escala y las líneas o textos de indicadores (por ejemplo LQ, POI, TARGET, 0.7).
 - precio_actual: el último precio, que es la etiqueta de la escala derecha con cuenta regresiva (mm:ss) o resaltada. Si no se distingue, null.
@@ -30,7 +31,7 @@ Escribí los números con punto decimal y sin separador de miles (por ejemplo 40
 Devolvé SOLO un JSON válido con estas claves:
 {"instrumento": "", "direccion": "BUY" | "SELL" | "", "entrada": 0, "stop_loss": 0, "take_profit_1": 0, "take_profit_2": null, "take_profit_3": null, "precio_actual": null, "varias_posiciones": false, "observaciones": ""}`;
 
-const AYUDA = `Mandame la captura de TradingView con la herramienta de posición (mejor como foto, con la herramienta seleccionada para que se vean los precios) y armo la señal.
+const AYUDA = `Mandame la captura de TradingView con la herramienta de posición (mejor como foto, con la herramienta seleccionada para que se vean los precios) y armo la señal. Se publica automáticamente en los grupos VIP.
 
 Opcional, en el texto de la foto:
 tp2 4060 tp3 4070 (más take profits)
@@ -45,8 +46,7 @@ Sin imagen:
 const PORT = process.env.PORT || 3000;
 
 // Publicación automática de las señales que genera el bot solo
-// (alertas de TradingView y señales por velas). Las fotos y /s siguen
-// el valor de MODO (confirmar por defecto).
+// (alertas de TradingView y señales por velas).
 const autoTV = () =>
   ["1", "true", "si", "sí", "on"].includes(String(process.env.AUTO_TV || "").toLowerCase());
 
@@ -75,6 +75,21 @@ app.post("/telegram", async (req, res) => {
 
 // --- TradingView: alertas del indicador Bias Toolkit V.2 ---
 const tvRecientes = new Map();
+
+// Antirrebote: true si la misma clave ya se vio dentro de la ventana (en ms).
+function repetida(clave, ventanaMs) {
+  const ahora = Date.now();
+
+  // Limpia entradas viejas para que el Map no crezca sin límite.
+  for (const [k, t] of tvRecientes) {
+    if (ahora - t > 600000) tvRecientes.delete(k);
+  }
+
+  if (ahora - (tvRecientes.get(clave) || 0) < ventanaMs) return true;
+
+  tvRecientes.set(clave, ahora);
+  return false;
+}
 
 app.post("/tradingview", express.text({ type: "*/*", limit: "100kb" }), async (req, res) => {
   if (!process.env.TRADINGVIEW_KEY || req.query.key !== process.env.TRADINGVIEW_KEY) {
@@ -105,15 +120,8 @@ app.post("/tradingview", express.text({ type: "*/*", limit: "100kb" }), async (r
     if (err) throw new Error(err);
 
     const clave = [lectura.instrumento, d.tf, lectura.direccion, lectura.entrada, lectura.stop_loss].join("|");
-    const ahora = Date.now();
 
-    // Limpia entradas viejas para que el Map no crezca sin límite.
-    for (const [k, t] of tvRecientes) {
-      if (ahora - t > 600000) tvRecientes.delete(k);
-    }
-
-    if (ahora - (tvRecientes.get(clave) || 0) < 120000) return;
-    tvRecientes.set(clave, ahora);
+    if (repetida(clave, 120000)) return;
 
     const senal = armarSenal(lectura, { estado: estadoAuto(), origen: "automática" });
     await entregar(dueño, senal, lectura, autoTV());
@@ -286,6 +294,46 @@ async function deImagen(chat, foto, caption) {
   const lectura = await leerGrafico(aBase64(buf), mime);
   const ajustes = leerCaption(caption);
 
+  // TP2 y TP3 del texto de la foto pasan a la lectura para validarlos junto con el resto.
+  if (ajustes.tp2 != null) lectura.take_profit_2 = num(ajustes.tp2);
+  if (ajustes.tp3 != null) lectura.take_profit_3 = num(ajustes.tp3);
+  delete ajustes.tp2;
+  delete ajustes.tp3;
+
+  // La dirección sale de los niveles, no de lo que diga el modelo.
+  const e = num(lectura.entrada);
+  const sl = num(lectura.stop_loss);
+
+  if (e != null && sl != null && e !== sl) {
+    const dirNiveles = sl > e ? "SELL" : "BUY";
+
+    if ((lectura.direccion || "").toUpperCase() !== dirNiveles) {
+      lectura.observaciones =
+        `${lectura.observaciones || ""} Dirección corregida a ${dirNiveles} según los niveles.`.trim();
+    }
+
+    lectura.direccion = dirNiveles;
+  }
+
+  // Si la lectura es incoherente no se publica nada.
+  const err = validar(lectura);
+  if (err) {
+    throw new Error(`Lectura inconsistente (${err}). No publiqué nada.`);
+  }
+
+  const claveFoto = [
+    "foto",
+    ajustes.instrumento || lectura.instrumento,
+    lectura.direccion,
+    lectura.entrada,
+    lectura.stop_loss,
+    lectura.take_profit_1,
+  ].join("|");
+
+  if (repetida(claveFoto, 120000)) {
+    throw new Error("Señal repetida: la misma lectura salió hace menos de 2 minutos. No la publiqué de nuevo.");
+  }
+
   await entregar(chat, armarSenal(lectura, { ...ajustes, origen: "manual" }), lectura);
 }
 
@@ -319,10 +367,17 @@ async function deTexto(chat, texto) {
     throw new Error(err);
   }
 
+  const claveTexto = ["texto", lectura.instrumento, lectura.direccion, entrada, sl, tp1].join("|");
+
+  if (repetida(claveTexto, 120000)) {
+    throw new Error("Señal repetida: la misma señal salió hace menos de 2 minutos. No la publiqué de nuevo.");
+  }
+
   await entregar(chat, armarSenal(lectura, { estado: p.estado, origen: "manual" }), lectura);
 }
 
 // forzarAuto = true publica directo en los canales VIP sin pedir confirmación.
+// Por defecto (MODO sin definir) también se publica directo. Con MODO=confirmar vuelve el botón.
 async function entregar(chat, senal, lectura, forzarAuto = false) {
   const aviso = [];
 
@@ -336,7 +391,7 @@ async function entregar(chat, senal, lectura, forzarAuto = false) {
 
   const resumen = `Lectura: ${senal.direccion} ${senal.instrumento}\n${senal.detalle}${aviso.length ? "\n" + aviso.join("\n") : ""}`;
 
-  if (forzarAuto || (process.env.MODO || "confirmar").toLowerCase() === "auto") {
+  if (forzarAuto || (process.env.MODO || "auto").toLowerCase() === "auto") {
     let resultado;
 
     try {
@@ -414,7 +469,16 @@ async function alTocarBoton(cb, dueño) {
   await responder("Publicando...");
   await quitarBotones();
 
-  const res = await publicar(texto);
+  let res;
+
+  try {
+    res = await publicar(texto);
+  } catch (e) {
+    // Si falla, se libera para poder reintentar reenviando la señal.
+    yaPublicados.delete(clave);
+    await enviar(chat, `No se pudo publicar: ${e.message}. Reenviá la señal para reintentar.`);
+    return;
+  }
 
   await enviar(chat, resultadoTexto(res));
 }
@@ -431,10 +495,14 @@ const waBase = () =>
 
 const waListo = () => Boolean(process.env.GREENAPI_ID && process.env.GREENAPI_TOKEN);
 
-const listaChats = (variable) =>
-  String(process.env[variable] || "")
-    .split(/[,\s;]+/)
-    .filter(Boolean);
+// Sin repetidos: el mismo chat dos veces gastaría cupo de Green API.
+const listaChats = (variable) => [
+  ...new Set(
+    String(process.env[variable] || "")
+      .split(/[,\s;]+/)
+      .filter(Boolean)
+  ),
+];
 
 async function waEnviar(chatId, texto) {
   const r = await fetch(
@@ -449,6 +517,10 @@ async function waEnviar(chatId, texto) {
   const j = await r.json().catch(() => ({}));
 
   if (!r.ok || !j.idMessage) {
+    if (r.status === 466) {
+      throw new Error("Green API 466: límite del plan Developer (3 chats por mes), hace falta el plan Business");
+    }
+
     throw new Error(`Green API ${r.status}`);
   }
 }
@@ -672,9 +744,15 @@ function validar(l) {
   const entrada = num(l.entrada);
   const sl = num(l.stop_loss);
   const tp1 = num(l.take_profit_1);
+  const tp2 = num(l.take_profit_2);
+  const tp3 = num(l.take_profit_3);
 
   if (entrada == null || sl == null || tp1 == null) {
     return "Faltan entrada, SL o TP1";
+  }
+
+  if (entrada <= 0) {
+    return "Entrada inválida";
   }
 
   if (dir === "BUY" && !(sl < entrada && entrada < tp1)) {
@@ -683,6 +761,25 @@ function validar(l) {
 
   if (dir === "SELL" && !(tp1 < entrada && entrada < sl)) {
     return "Para SELL debe ser TP < Entrada < SL";
+  }
+
+  // TP2 y TP3, si existen, tienen que estar del lado de la ganancia.
+  for (const tp of [tp2, tp3]) {
+    if (tp == null) continue;
+
+    if (dir === "BUY" && !(tp > entrada)) return "Para BUY los TP deben estar sobre la entrada";
+    if (dir === "SELL" && !(tp < entrada)) return "Para SELL los TP deben estar bajo la entrada";
+  }
+
+  // Control de cordura: un nivel muy lejos de la entrada suele ser un dígito mal leído.
+  const maxPct = Number(process.env.MAX_DIST_PCT || 3);
+
+  for (const n of [sl, tp1, tp2, tp3]) {
+    if (n == null) continue;
+
+    if ((Math.abs(n - entrada) / entrada) * 100 > maxPct) {
+      return `El nivel ${n} está demasiado lejos de la entrada (posible error de lectura)`;
+    }
   }
 
   return null;
@@ -1231,6 +1328,7 @@ async function revisarVelas() {
 
     const senales = biasToolkit(velas, tvConfig());
     const ultimaT = velas[velas.length - 1].t;
+    const ultimoCierre = velas[velas.length - 1].close;
 
     tvErrorAvisado = false;
 
@@ -1250,6 +1348,20 @@ async function revisarVelas() {
     for (const s of nuevas) {
       if (Number.isFinite(maxEdadMin) && ultimaT - s.t > maxEdadMin * 60000) {
         console.error("Señal descartada por antigua:", new Date(s.t).toISOString());
+        continue;
+      }
+
+      // Si el precio ya tocó el SL o el TP1 desde que se generó la señal, no se publica.
+      const yaTocada =
+        (s.side === "BUY" && (ultimoCierre <= s.sl || ultimoCierre >= s.tp[0])) ||
+        (s.side === "SELL" && (ultimoCierre >= s.sl || ultimoCierre <= s.tp[0]));
+
+      if (yaTocada) {
+        console.error(
+          "Señal descartada: el precio ya tocó SL o TP1",
+          new Date(s.t).toISOString(),
+          `cierre ${ultimoCierre}`
+        );
         continue;
       }
 
@@ -1310,7 +1422,8 @@ function iniciarVelas() {
   }
 
   const ms = TV_INTERVALOS[process.env.TV_INTERVAL || "1min"] || 60000;
-  const cada = Math.max(ms, Number(process.env.TV_POLL_SEG || 120) * 1000);
+  // 180 s por defecto: ~480 consultas por día de mercado, dentro del cupo gratis de Twelve Data (800).
+  const cada = Math.max(ms, Number(process.env.TV_POLL_SEG || 180) * 1000);
 
   setTimeout(revisarVelas, 5000);
   setInterval(revisarVelas, cada);
