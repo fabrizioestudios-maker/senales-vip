@@ -1,7 +1,22 @@
 // TRADING INSTITUCIONAL | Bot de señales VIP (Railway)
 const express = require("express");
+const crypto = require("crypto");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
+
+// Comparación en tiempo constante. Devuelve false si falta alguno de los dos valores
+// (antes, con WEBHOOK_SECRET sin definir, "undefined !== undefined" dejaba pasar a cualquiera).
+function igual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || !a || !b) return false;
+  const ha = crypto.createHash("sha256").update(a).digest();
+  const hb = crypto.createHash("sha256").update(b).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+// fetch con tiempo máximo: un pedido colgado no debe trabar el bot (ni dejar tvOcupado en true).
+const fetchT = (url, opts = {}, ms = 45000) => fetch(url, { ...opts, signal: AbortSignal.timeout(ms) });
+
+const pausa = (ms) => new Promise((ok) => setTimeout(ok, ms));
 
 const TITULO = "*TRADING INSTITUCIONAL | SIGNALS VIP*";
 const AVISO_RIESGO =
@@ -60,7 +75,7 @@ app.get("/setup", setup);
 app.post("/telegram", async (req, res) => {
   const secret = req.headers["x-telegram-bot-api-secret-token"];
 
-  if (secret !== process.env.WEBHOOK_SECRET) {
+  if (!igual(secret, process.env.WEBHOOK_SECRET)) {
     return res.status(403).send("forbidden");
   }
 
@@ -92,7 +107,7 @@ function repetida(clave, ventanaMs) {
 }
 
 app.post("/tradingview", express.text({ type: "*/*", limit: "100kb" }), async (req, res) => {
-  if (!process.env.TRADINGVIEW_KEY || req.query.key !== process.env.TRADINGVIEW_KEY) {
+  if (!igual(req.query.key, process.env.TRADINGVIEW_KEY)) {
     return res.status(403).send("forbidden");
   }
 
@@ -135,7 +150,7 @@ app.post("/tradingview", express.text({ type: "*/*", limit: "100kb" }), async (r
 
 // Prueba: abrila desde Chrome. Manda un ejemplo solo a tu Telegram, no publica nada.
 app.get("/tradingview/test", async (req, res) => {
-  if (!process.env.TRADINGVIEW_KEY || req.query.key !== process.env.TRADINGVIEW_KEY) {
+  if (!igual(req.query.key, process.env.TRADINGVIEW_KEY)) {
     return res.status(403).send("forbidden");
   }
 
@@ -159,11 +174,13 @@ app.get("/tradingview/test", async (req, res) => {
 
 app.listen(PORT, () => console.log(`Bot escuchando en puerto ${PORT}`));
 
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e));
+
 async function setup(req, res) {
   // Clave propia para /setup (SETUP_KEY). Si no existe, usa WEBHOOK_SECRET como antes.
   const claveSetup = process.env.SETUP_KEY || process.env.WEBHOOK_SECRET;
 
-  if (!process.env.WEBHOOK_SECRET || !claveSetup || req.query.key !== claveSetup) {
+  if (!process.env.WEBHOOK_SECRET || !igual(req.query.key, claveSetup)) {
     return res.status(403).send("forbidden");
   }
 
@@ -184,7 +201,7 @@ async function setup(req, res) {
 }
 
 async function tg(method, body) {
-  const r = await fetch(
+  const r = await fetchT(
     `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/${method}`,
     {
       method: "POST",
@@ -280,7 +297,7 @@ async function deImagen(chat, foto, caption) {
     file_id: foto.file_id,
   });
 
-  const resp = await fetch(
+  const resp = await fetchT(
     `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${f.file_path}`
   );
 
@@ -289,7 +306,8 @@ async function deImagen(chat, foto, caption) {
   }
 
   const buf = await resp.arrayBuffer();
-  const mime = /\.png$/i.test(f.file_path) ? "image/png" : "image/jpeg";
+  const ext = ((f.file_path.match(/\.(\w+)$/) || [])[1] || "").toLowerCase();
+  const mime = ext === "png" ? "image/png" : ext === "webp" ? "image/webp" : "image/jpeg";
 
   const lectura = await leerGrafico(aBase64(buf), mime);
   const ajustes = leerCaption(caption);
@@ -319,6 +337,22 @@ async function deImagen(chat, foto, caption) {
   const err = validar(lectura);
   if (err) {
     throw new Error(`Lectura inconsistente (${err}). No publiqué nada.`);
+  }
+
+  // Si la entrada está lejos del precio actual que se ve en la captura, casi siempre es un dígito mal leído.
+  // MAX_DIST_PRECIO_PCT (2 por defecto); con 0 se desactiva.
+  const precio = num(lectura.precio_actual);
+  const rawMax = process.env.MAX_DIST_PRECIO_PCT;
+  const maxPrecio = rawMax !== undefined && rawMax !== "" && Number.isFinite(Number(rawMax)) ? Number(rawMax) : 2;
+
+  if (maxPrecio > 0 && precio != null && precio > 0) {
+    const pct = (Math.abs(num(lectura.entrada) - precio) / precio) * 100;
+
+    if (pct > maxPrecio) {
+      throw new Error(
+        `La entrada (${lectura.entrada}) está a ${pct.toFixed(1)}% del precio actual leído (${precio}): posible error de lectura. No publiqué nada.`
+      );
+    }
   }
 
   const claveFoto = [
@@ -376,9 +410,10 @@ async function deTexto(chat, texto) {
   await entregar(chat, armarSenal(lectura, { estado: p.estado, origen: "manual" }), lectura);
 }
 
-// forzarAuto = true publica directo en los canales VIP sin pedir confirmación.
-// Por defecto (MODO sin definir) también se publica directo. Con MODO=confirmar vuelve el botón.
-async function entregar(chat, senal, lectura, forzarAuto = false) {
+// directo = true  -> publica en los canales VIP sin pedir confirmación.
+// directo = false -> pide confirmación con botones (señales automáticas con AUTO_TV apagado).
+// directo = null  -> decide MODO (señales manuales): "auto" por defecto publica directo; MODO=confirmar pide botón.
+async function entregar(chat, senal, lectura, directo = null) {
   const aviso = [];
 
   if (lectura.varias_posiciones) {
@@ -391,7 +426,9 @@ async function entregar(chat, senal, lectura, forzarAuto = false) {
 
   const resumen = `Lectura: ${senal.direccion} ${senal.instrumento}\n${senal.detalle}${aviso.length ? "\n" + aviso.join("\n") : ""}`;
 
-  if (forzarAuto || (process.env.MODO || "auto").toLowerCase() === "auto") {
+  const publicarYa = directo !== null ? directo : (process.env.MODO || "auto").toLowerCase() === "auto";
+
+  if (publicarYa) {
     let resultado;
 
     try {
@@ -505,7 +542,7 @@ const listaChats = (variable) => [
 ];
 
 async function waEnviar(chatId, texto) {
-  const r = await fetch(
+  const r = await fetchT(
     `${waBase()}/waInstance${process.env.GREENAPI_ID}/sendMessage/${process.env.GREENAPI_TOKEN}`,
     {
       method: "POST",
@@ -537,6 +574,8 @@ async function publicar(texto) {
       } catch (e) {
         res.push(["WhatsApp Señales VIP", false, e.message]);
       }
+
+      await pausa(1500);
     }
   }
 
@@ -582,6 +621,8 @@ async function publicar(texto) {
         } catch (e) {
           res.push(["WhatsApp Avisos", false, e.message]);
         }
+
+        await pausa(1500);
       }
     }
   }
@@ -595,8 +636,9 @@ async function listarGrupos(chat) {
     throw new Error("Faltan GREENAPI_ID / GREENAPI_TOKEN");
   }
 
-  const r = await fetch(
-    `${waBase()}/waInstance${process.env.GREENAPI_ID}/getContacts/${process.env.GREENAPI_TOKEN}`
+  // group=true: solo grupos (sin el filtro devuelve todos los contactos, que puede ser enorme).
+  const r = await fetchT(
+    `${waBase()}/waInstance${process.env.GREENAPI_ID}/getContacts/${process.env.GREENAPI_TOKEN}?group=true`
   );
 
   const j = await r.json().catch(() => null);
@@ -630,17 +672,7 @@ async function listarGrupos(chat) {
 }
 
 function aBase64(buf) {
-  const bytes = new Uint8Array(buf);
-  let s = "";
-
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    s += String.fromCharCode.apply(
-      null,
-      bytes.subarray(i, i + 0x8000)
-    );
-  }
-
-  return btoa(s);
+  return Buffer.from(buf).toString("base64");
 }
 
 async function gemini(modelo, b64, mime) {
@@ -667,7 +699,7 @@ async function gemini(modelo, b64, mime) {
   });
 
   for (let intento = 0; intento < 2; intento++) {
-    const r = await fetch(
+    const r = await fetchT(
       `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`,
       {
         method: "POST",
@@ -771,6 +803,15 @@ function validar(l) {
     if (dir === "SELL" && !(tp < entrada)) return "Para SELL los TP deben estar bajo la entrada";
   }
 
+  // TP1, TP2 y TP3 tienen que alejarse de la entrada en ese orden.
+  const cadena = [tp1, tp2, tp3].filter((x) => x != null);
+
+  for (let i = 1; i < cadena.length; i++) {
+    if (dir === "BUY" ? cadena[i] <= cadena[i - 1] : cadena[i] >= cadena[i - 1]) {
+      return "Los take profits deben alejarse de la entrada en orden (TP1, TP2, TP3)";
+    }
+  }
+
   // Control de cordura: un nivel muy lejos de la entrada suele ser un dígito mal leído.
   const maxPct = Number(process.env.MAX_DIST_PCT || 3);
 
@@ -800,12 +841,16 @@ function fmt(n) {
 function armarSenal(lectura, ajustes = {}) {
   const dir = (lectura.direccion || "").toUpperCase();
 
-  const instrumento = (
-    ajustes.instrumento ||
-    lectura.instrumento ||
-    process.env.INSTRUMENTO_DEFECTO ||
-    "XAUUSD"
-  ).toUpperCase();
+  const instrumento =
+    String(
+      ajustes.instrumento ||
+        lectura.instrumento ||
+        process.env.INSTRUMENTO_DEFECTO ||
+        "XAUUSD"
+    )
+      .replace(/^.*:/, "")
+      .replace(/[^A-Za-z0-9._]/g, "")
+      .toUpperCase() || "XAUUSD";
 
   const entrada = num(lectura.entrada);
   const sl = num(lectura.stop_loss);
@@ -940,6 +985,8 @@ function tvConfig() {
     slBuffer: n("SL_BUFFER", 0),
     tp: [n("TP1_R", 1), n("TP2_R", 2), n("TP3_R", 3)],
     mecha: String(process.env.BREAK_SOURCE || "Close").toLowerCase() === "wick",
+    // "nivel": entra en el 0.7 / zona de confluencia (como hasta ahora). "close": cierre de la vela, igual que el webhook del Pine.
+    entrada: String(process.env.TV_ENTRY || "nivel").toLowerCase() === "close" ? "close" : "nivel",
   };
 }
 
@@ -959,6 +1006,109 @@ function pivote(arr, i, len, alto) {
   return v;
 }
 
+// Estado de una estructura (swing o interna). Mismos campos que el tipo Structure del Pine.
+function nuevaEstructura() {
+  return {
+    hi: null, lo: null, hiBar: null, loBar: null,
+    hiFija: false, loFija: false, trend: 0,
+    ultPH: null, ultPL: null, ultPHBar: null, ultPLBar: null,
+    brkBar: null,
+  };
+}
+
+// Port línea por línea de f_updateStructure del Pine. Devuelve true si se abrió un rango nuevo.
+function actualizarEstructura(s, i, v, pivH, pivL, len, srcUp, srcDn, permiteContinuar, tick) {
+  let nuevoRango = false;
+
+  if (pivH !== null) {
+    s.ultPH = pivH;
+    s.ultPHBar = i - len;
+
+    if (s.trend === 0) {
+      s.hi = pivH; s.hiBar = s.ultPHBar; s.hiFija = true;
+    } else if (s.trend === 1 && pivH >= s.hi - tick) {
+      s.hi = pivH; s.hiBar = s.ultPHBar; s.hiFija = true;
+    }
+  }
+
+  if (pivL !== null) {
+    s.ultPL = pivL;
+    s.ultPLBar = i - len;
+
+    if (s.trend === 0) {
+      s.lo = pivL; s.loBar = s.ultPLBar; s.loFija = true;
+    } else if (s.trend === -1 && pivL <= s.lo + tick) {
+      s.lo = pivL; s.loBar = s.ultPLBar; s.loFija = true;
+    }
+  }
+
+  let bull = s.hi !== null && srcUp > s.hi && (s.trend <= 0 || (permiteContinuar && s.hiFija));
+  let bear = s.lo !== null && srcDn < s.lo && (s.trend >= 0 || (permiteContinuar && s.loFija));
+
+  if (bull && bear) {
+    bull = v.close >= v.open;
+    bear = !bull;
+  }
+
+  if (bull) {
+    s.trend = 1;
+
+    if (s.ultPL !== null && s.ultPLBar < i) {
+      s.lo = s.ultPL; s.loBar = s.ultPLBar; s.loFija = true;
+    }
+
+    s.hi = v.high; s.hiBar = i; s.hiFija = false;
+    s.brkBar = i;
+    nuevoRango = true;
+  } else if (bear) {
+    s.trend = -1;
+
+    if (s.ultPH !== null && s.ultPHBar < i) {
+      s.hi = s.ultPH; s.hiBar = s.ultPHBar; s.hiFija = true;
+    }
+
+    s.lo = v.low; s.loBar = i; s.loFija = false;
+    s.brkBar = i;
+    nuevoRango = true;
+  }
+
+  if (s.trend === 1 && (s.hi === null || v.high > s.hi)) {
+    if (s.ultPL !== null && s.hiBar !== null && s.ultPLBar > s.hiBar) {
+      s.lo = s.ultPL; s.loBar = s.ultPLBar; s.loFija = true;
+      s.brkBar = i;
+      nuevoRango = true;
+    }
+
+    s.hi = v.high; s.hiBar = i; s.hiFija = false;
+  }
+
+  if (s.trend === -1 && (s.lo === null || v.low < s.lo)) {
+    if (s.ultPH !== null && s.loBar !== null && s.ultPHBar > s.loBar) {
+      s.hi = s.ultPH; s.hiBar = s.ultPHBar; s.hiFija = true;
+      s.brkBar = i;
+      nuevoRango = true;
+    }
+
+    s.lo = v.low; s.loBar = i; s.loFija = false;
+  }
+
+  return nuevoRango;
+}
+
+// Zona dorada de una estructura (f_zoneBounds del Pine). p2 es el nivel del ratio mayor (0.7).
+function zonaDorada(s, z1, z2) {
+  if (s.trend === 0 || s.hi === null || s.lo === null || !(s.hi > s.lo)) return null;
+
+  const rng = s.hi - s.lo;
+  const p1 = s.trend === 1 ? s.hi - rng * z1 : s.lo + rng * z1;
+  const p2 = s.trend === 1 ? s.hi - rng * z2 : s.lo + rng * z2;
+
+  return { top: Math.max(p1, p2), bot: Math.min(p1, p2), p2 };
+}
+
+// Señales de Bias Toolkit V.2. Replica la lógica del indicador Pine (estructura swing + interna,
+// señal por estructura y por confluencia de zonas, una sola señal por rango, sin señales en la misma
+// vela de una ruptura). Si cambiás el Pine, cambiá esto igual.
 function biasToolkit(velas, cfg) {
   const z1 = Math.min(cfg.zonaA, cfg.zonaB);
   const z2 = Math.max(cfg.zonaA, cfg.zonaB);
@@ -966,296 +1116,95 @@ function biasToolkit(velas, cfg) {
   const bajos = velas.map((v) => v.low);
   const redondear = (x) => Number(x.toFixed(cfg.decimales));
 
-  let ultSPH = null, ultSPL = null, ultSPHBar = null, ultSPLBar = null;
-  let sHigh = null, sLow = null, sHighBar = null, sLowBar = null;
-  let sHighFija = false, sLowFija = false, sTrend = 0;
+  const sw = nuevaEstructura();
+  const it = nuevaEstructura();
 
-  let ultIPH = null, ultIPL = null, ultIPHBar = null, ultIPLBar = null;
-  let iHigh = null, iLow = null, iHighBar = null, iLowBar = null;
-  let iHighFija = false, iLowFija = false, iTrend = 0;
-
-  let senalDisparada = false;
-  let confluenciaDisparada = false;
+  let estructuraUsada = false;
+  let confluenciaUsada = false;
 
   const salida = [];
 
   for (let i = 0; i < velas.length; i++) {
-    const { open, high, low, close } = velas[i];
+    const v = velas[i];
+    const srcUp = cfg.mecha ? v.high : v.close;
+    const srcDn = cfg.mecha ? v.low : v.close;
 
-    const sPH = pivote(altos, i, cfg.swingLen, true);
-    const sPL = pivote(bajos, i, cfg.swingLen, false);
-    const iPH = pivote(altos, i, cfg.internalLen, true);
-    const iPL = pivote(bajos, i, cfg.internalLen, false);
+    const nuevoSw = actualizarEstructura(
+      sw, i, v,
+      pivote(altos, i, cfg.swingLen, true), pivote(bajos, i, cfg.swingLen, false),
+      cfg.swingLen, srcUp, srcDn, true, cfg.mintick
+    );
 
-    // --- Pivotes mayores ---
-    if (sPH !== null) {
-      ultSPH = sPH;
-      ultSPHBar = i - cfg.swingLen;
+    const nuevoIt = actualizarEstructura(
+      it, i, v,
+      pivote(altos, i, cfg.internalLen, true), pivote(bajos, i, cfg.internalLen, false),
+      cfg.internalLen, srcUp, srcDn, false, cfg.mintick
+    );
 
-      if (sTrend === 0) {
-        if (sHigh === null) {
-          sHigh = sPH;
-          sHighBar = ultSPHBar;
-          sHighFija = true;
-        }
-      } else if (sTrend === 1 && !sHighFija && sPH >= sHigh - cfg.mintick) {
-        sHigh = sPH;
-        sHighBar = ultSPHBar;
-        sHighFija = true;
-      }
+    // Solo un rango nuevo libera otra señal (no cualquier máximo o mínimo nuevo).
+    if (nuevoSw || nuevoIt) {
+      estructuraUsada = false;
+      confluenciaUsada = false;
     }
 
-    if (sPL !== null) {
-      ultSPL = sPL;
-      ultSPLBar = i - cfg.swingLen;
+    const zi = zonaDorada(it, z1, z2);
+    const zs = zonaDorada(sw, z1, z2);
+    const alineadas = sw.trend !== 0 && sw.trend === it.trend;
+    const asentada = i > Math.max(sw.brkBar ?? 0, it.brkBar ?? 0);
+    const swMid = sw.hi !== null && sw.lo !== null ? (sw.hi + sw.lo) / 2 : null;
+    const p2 = zi ? zi.p2 : null;
 
-      if (sTrend === 0) {
-        if (sLow === null) {
-          sLow = sPL;
-          sLowBar = ultSPLBar;
-          sLowFija = true;
-        }
-      } else if (sTrend === -1 && !sLowFija && sPL <= sLow + cfg.mintick) {
-        sLow = sPL;
-        sLowBar = ultSPLBar;
-        sLowFija = true;
-      }
+    const structSell =
+      alineadas && it.trend === -1 && p2 !== null && swMid !== null && p2 > swMid && v.high >= p2;
+    const structBuy =
+      alineadas && it.trend === 1 && p2 !== null && swMid !== null && p2 < swMid && v.low <= p2;
+
+    let ovTop = null, ovBot = null, solapan = false;
+
+    if (zi && zs) {
+      ovTop = Math.min(zs.top, zi.top);
+      ovBot = Math.max(zs.bot, zi.bot);
+
+      const alto = ovTop - ovBot;
+      const menor = Math.min(zs.top - zs.bot, zi.top - zi.bot);
+
+      solapan = alineadas && alto > 0 && menor > 0 && (alto / menor) * 100 >= cfg.solapePct;
     }
 
-    // --- Pivotes internos ---
-    if (iPH !== null) {
-      ultIPH = iPH;
-      ultIPHBar = i - cfg.internalLen;
+    const confSell = solapan && it.trend === -1 && v.high >= ovBot && v.low <= ovTop;
+    const confBuy = solapan && it.trend === 1 && v.low <= ovTop && v.high >= ovBot;
 
-      if (iTrend === 0) {
-        if (iHigh === null) {
-          iHigh = iPH;
-          iHighBar = ultIPHBar;
-          iHighFija = true;
-        }
-      } else if (iTrend === 1 && !iHighFija && iPH >= iHigh - cfg.mintick) {
-        iHigh = iPH;
-        iHighBar = ultIPHBar;
-        iHighFija = true;
-      }
-    }
+    const sellEstr = structSell && !estructuraUsada && asentada;
+    const buyEstr = structBuy && !estructuraUsada && asentada;
+    const sellConf = confSell && !confluenciaUsada && asentada;
+    const buyConf = confBuy && !confluenciaUsada && asentada;
 
-    if (iPL !== null) {
-      ultIPL = iPL;
-      ultIPLBar = i - cfg.internalLen;
+    if (sellEstr || buyEstr) estructuraUsada = true;
+    if (sellConf || buyConf) confluenciaUsada = true;
 
-      if (iTrend === 0) {
-        if (iLow === null) {
-          iLow = iPL;
-          iLowBar = ultIPLBar;
-          iLowFija = true;
-        }
-      } else if (iTrend === -1 && !iLowFija && iPL <= iLow + cfg.mintick) {
-        iLow = iPL;
-        iLowBar = ultIPLBar;
-        iLowFija = true;
-      }
-    }
+    const esBuy = buyEstr || buyConf;
+    const esSell = sellEstr || sellConf;
 
-    // --- Rupturas ---
-    const fuenteSup = cfg.mecha ? high : close;
-    const fuenteInf = cfg.mecha ? low : close;
+    if (!esBuy && !esSell) continue;
 
-    let sBull = sHigh !== null && fuenteSup > sHigh && (sTrend <= 0 || sHighFija);
-    let sBear = sLow !== null && fuenteInf < sLow && (sTrend >= 0 || sLowFija);
-    let iBull = iHigh !== null && fuenteSup > iHigh && (iTrend <= 0 || iHighFija);
-    let iBear = iLow !== null && fuenteInf < iLow && (iTrend >= 0 || iLowFija);
+    const porEstructura = esBuy ? buyEstr : sellEstr;
+    const nivel = porEstructura ? p2 : esBuy ? ovTop : ovBot;
+    const entry = cfg.entrada === "close" ? v.close : nivel;
+    const sl = esBuy ? it.lo - cfg.slBuffer : it.hi + cfg.slBuffer;
 
-    if (sBull && sBear) {
-      sBull = close >= open;
-      sBear = !sBull;
-    }
+    if (esBuy ? !(sl < entry) : !(sl > entry)) continue;
 
-    if (iBull && iBear) {
-      iBull = close >= open;
-      iBear = !iBull;
-    }
+    const riesgo = Math.abs(entry - sl);
+    const dir = esBuy ? 1 : -1;
 
-    // --- Transiciones swing ---
-    if (sBull) {
-      sTrend = 1;
-
-      if (ultSPL !== null && ultSPLBar < i) {
-        sLow = ultSPL;
-        sLowBar = ultSPLBar;
-        sLowFija = true;
-      }
-
-      sHigh = high;
-      sHighBar = i;
-      sHighFija = false;
-      confluenciaDisparada = false;
-    }
-
-    if (sBear) {
-      sTrend = -1;
-
-      if (ultSPH !== null && ultSPHBar < i) {
-        sHigh = ultSPH;
-        sHighBar = ultSPHBar;
-        sHighFija = true;
-      }
-
-      sLow = low;
-      sLowBar = i;
-      sLowFija = false;
-      confluenciaDisparada = false;
-    }
-
-    if (sTrend === 1 && !sHighFija && (sHigh === null || high > sHigh)) {
-      sHigh = high;
-      sHighBar = i;
-      confluenciaDisparada = false;
-    }
-
-    if (sTrend === -1 && !sLowFija && (sLow === null || low < sLow)) {
-      sLow = low;
-      sLowBar = i;
-      confluenciaDisparada = false;
-    }
-
-    // --- Transiciones internas ---
-    if (iBull) {
-      iTrend = 1;
-
-      if (ultIPL !== null) {
-        iLow = ultIPL;
-        iLowBar = ultIPLBar;
-        iLowFija = true;
-      }
-
-      iHigh = high;
-      iHighBar = i;
-      iHighFija = false;
-      senalDisparada = false;
-      confluenciaDisparada = false;
-    }
-
-    if (iBear) {
-      iTrend = -1;
-
-      if (ultIPH !== null) {
-        iHigh = ultIPH;
-        iHighBar = ultIPHBar;
-        iHighFija = true;
-      }
-
-      iLow = low;
-      iLowBar = i;
-      iLowFija = false;
-      senalDisparada = false;
-      confluenciaDisparada = false;
-    }
-
-    if (iTrend === 1 && !iHighFija && (iHigh === null || high > iHigh)) {
-      iHigh = high;
-      iHighBar = i;
-      senalDisparada = false;
-      confluenciaDisparada = false;
-    }
-
-    if (iTrend === -1 && !iLowFija && (iLow === null || low < iLow)) {
-      iLow = low;
-      iLowBar = i;
-      senalDisparada = false;
-      confluenciaDisparada = false;
-    }
-
-    // --- Rangos y zonas ---
-    const validoI =
-      iHigh !== null && iLow !== null && iHighBar !== null && iLowBar !== null && iHigh > iLow;
-    const validoS =
-      sHigh !== null && sLow !== null && sHighBar !== null && sLowBar !== null && sHigh > sLow;
-
-    let iSegundo = null, iTop = null, iBot = null;
-    let sTop = null, sBot = null;
-
-    if (validoI && iTrend !== 0) {
-      const tam = iHigh - iLow;
-      const a = iTrend === 1 ? iHigh - tam * z1 : iLow + tam * z1;
-      const b = iTrend === 1 ? iHigh - tam * z2 : iLow + tam * z2;
-      iSegundo = b;
-      iTop = Math.max(a, b);
-      iBot = Math.min(a, b);
-    }
-
-    if (validoS && sTrend !== 0) {
-      const tam = sHigh - sLow;
-      const a = sTrend === 1 ? sHigh - tam * z1 : sLow + tam * z1;
-      const b = sTrend === 1 ? sHigh - tam * z2 : sLow + tam * z2;
-      sTop = Math.max(a, b);
-      sBot = Math.min(a, b);
-    }
-
-    // --- Señales ---
-    const swingMid = validoS ? (sHigh + sLow) / 2 : null;
-    const profundo = iSegundo;
-    const alineadas = sTrend !== 0 && sTrend === iTrend;
-    const alineadasBajista = sTrend === -1 && iTrend === -1;
-    const alineadasAlcista = sTrend === 1 && iTrend === 1;
-
-    const sellSignal =
-      !senalDisparada && alineadasBajista && profundo !== null && swingMid !== null &&
-      profundo > swingMid && high >= profundo;
-    const buySignal =
-      !senalDisparada && alineadasAlcista && profundo !== null && swingMid !== null &&
-      profundo < swingMid && low <= profundo;
-
-    let solapeInf = null, solapeSup = null, coinciden = false;
-
-    if (iTop !== null && sTop !== null) {
-      solapeInf = Math.max(sBot, iBot);
-      solapeSup = Math.min(sTop, iTop);
-      const solape = solapeSup - solapeInf;
-      const menor = Math.min(sTop - sBot, iTop - iBot);
-      coinciden = alineadas && solape >= 0 && solape >= (menor * cfg.solapePct) / 100;
-    }
-
-    const confSell = !confluenciaDisparada && coinciden && sTrend === -1 && high >= solapeInf;
-    const confBuy = !confluenciaDisparada && coinciden && sTrend === 1 && low <= solapeSup;
-
-    if (sellSignal || buySignal) senalDisparada = true;
-    if (confSell || confBuy) confluenciaDisparada = true;
-
-    const sellAny = sellSignal || confSell;
-    const buyAny = buySignal || confBuy;
-
-    const emitir = (side, entry, sl, tipo) => {
-      const riesgo = Math.abs(entry - sl);
-      const dir = side === "BUY" ? 1 : -1;
-
-      salida.push({
-        t: velas[i].t,
-        side,
-        tipo,
-        entry: redondear(entry),
-        sl: redondear(sl),
-        tp: cfg.tp.map((r) => redondear(entry + dir * riesgo * r)),
-      });
-    };
-
-    if (sellAny) {
-      const entry = sellSignal ? profundo : solapeInf;
-      const sl = iHigh !== null ? iHigh + cfg.slBuffer : null;
-
-      if (entry !== null && sl !== null && sl > entry) {
-        emitir("SELL", entry, sl, sellSignal ? "estructura" : "confluencia");
-      }
-    }
-
-    if (buyAny) {
-      const entry = buySignal ? profundo : solapeSup;
-      const sl = iLow !== null ? iLow - cfg.slBuffer : null;
-
-      if (entry !== null && sl !== null && sl < entry) {
-        emitir("BUY", entry, sl, buySignal ? "estructura" : "confluencia");
-      }
-    }
+    salida.push({
+      t: v.t,
+      side: esBuy ? "BUY" : "SELL",
+      tipo: porEstructura ? "estructura" : "confluencia",
+      entry: redondear(entry),
+      sl: redondear(sl),
+      tp: cfg.tp.map((r) => redondear(entry + dir * riesgo * r)),
+    });
   }
 
   return salida;
@@ -1275,7 +1224,7 @@ async function traerVelas() {
   url.searchParams.set("timezone", "UTC");
   url.searchParams.set("apikey", process.env.TWELVEDATA_KEY);
 
-  const r = await fetch(url);
+  const r = await fetchT(url);
   const j = await r.json().catch(() => ({}));
 
   if (!r.ok || j.status === "error" || !Array.isArray(j.values)) {
@@ -1435,7 +1384,7 @@ function iniciarVelas() {
 
 // Validación: lista las últimas señales que calcula el motor (hora UTC).
 app.get("/velas/senales", async (req, res) => {
-  if (!process.env.TRADINGVIEW_KEY || req.query.key !== process.env.TRADINGVIEW_KEY) {
+  if (!igual(req.query.key, process.env.TRADINGVIEW_KEY)) {
     return res.status(403).send("forbidden");
   }
 
