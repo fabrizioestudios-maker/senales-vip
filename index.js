@@ -56,7 +56,12 @@ GBPUSD (cambia el instrumento)
 Sin imagen:
 /s buy 4043 4039 4054
 /s sell 4026 4031 4016 4010 mercado
-(dirección, entrada, stop loss, TP1 y, si querés, TP2 y TP3)\n\n/grupos (lista tus grupos de WhatsApp con su ID)`;
+(dirección, entrada, stop loss, TP1 y, si querés, TP2 y TP3)\n\n/grupos (lista tus grupos de WhatsApp con su ID)\n\n/analizar (o el botón): busca entradas con Bias Toolkit V.3`;
+
+// Botón "Analizar entradas" (también con /menu o /analizar)
+const TECLADO_MENU = {
+  inline_keyboard: [[{ text: "🔍 Analizar entradas", callback_data: "analizar" }]],
+};
 
 const PORT = process.env.PORT || 3000;
 
@@ -279,7 +284,15 @@ async function procesar(update) {
       return await deTexto(m.chat.id, texto);
     }
 
-    await enviar(m.chat.id, AYUDA);
+    if (/^\/analizar\b/i.test(texto)) {
+      return await analizarSeguro(m.chat.id);
+    }
+
+    if (/^\/menu\b/i.test(texto)) {
+      return await enviar(m.chat.id, "Panel de señales:", { reply_markup: TECLADO_MENU });
+    }
+
+    await enviar(m.chat.id, AYUDA, { reply_markup: TECLADO_MENU });
   } catch (e) {
     if (dueño) {
       await enviar(dueño, `No pude armar la señal: ${e.message}`).catch(() => {});
@@ -482,6 +495,12 @@ async function alTocarBoton(cb, dueño) {
   if (cb.data === "cancel") {
     await responder("Cancelada");
     await quitarBotones();
+    return;
+  }
+
+  if (cb.data === "analizar") {
+    await responder("Analizando...");
+    await analizarSeguro(chat);
     return;
   }
 
@@ -1409,5 +1428,446 @@ app.get("/velas/senales", async (req, res) => {
     res.status(500).send(e.message);
   }
 });
+
+// =====================================================================
+// BIAS TOOLKIT V.3 (lo usa el botón "Analizar entradas")
+// =====================================================================
+
+async function traerVelasDe(intervalo, cantidad) {
+  const ms = TV_INTERVALOS[intervalo];
+
+  if (!ms) throw new Error(`Intervalo no soportado: ${intervalo}`);
+  if (!process.env.TWELVEDATA_KEY) throw new Error("Falta TWELVEDATA_KEY");
+
+  const url = new URL("https://api.twelvedata.com/time_series");
+  url.searchParams.set("symbol", process.env.TV_SYMBOL || "XAU/USD");
+  url.searchParams.set("interval", intervalo);
+  url.searchParams.set("outputsize", String(cantidad));
+  url.searchParams.set("timezone", "UTC");
+  url.searchParams.set("apikey", process.env.TWELVEDATA_KEY);
+
+  const r = await fetchT(url);
+  const j = await r.json().catch(() => ({}));
+
+  if (!r.ok || j.status === "error" || !Array.isArray(j.values)) {
+    throw new Error(`Twelve Data: ${j.message || r.status}`);
+  }
+
+  const ahora = Date.now();
+
+  const velas = j.values
+    .map((v) => ({
+      t: Date.parse(String(v.datetime).replace(" ", "T") + "Z"),
+      open: parseFloat(v.open),
+      high: parseFloat(v.high),
+      low: parseFloat(v.low),
+      close: parseFloat(v.close),
+    }))
+    .filter((v) => Number.isFinite(v.t) && Number.isFinite(v.close))
+    .sort((a, b) => a.t - b.t)
+    .filter((v) => v.t + ms <= ahora);
+
+  return { velas, ms, intervalo };
+}
+
+function v3Config() {
+  const n = (k, d) => {
+    const v = process.env[k];
+    return v !== undefined && v !== "" && Number.isFinite(Number(v)) ? Number(v) : d;
+  };
+  const s = (k, d) => String(process.env[k] || d).toLowerCase();
+
+  return {
+    swingLen: n("V3_SWING", 50),
+    internalLen: n("V3_INTERNAL", 5),
+    lqMax: n("V3_LQ_MAX", 10),
+    lqWindow: n("V3_LQ_VENTANA", 30),
+    lqCierre: s("V3_LQ_SWEEP", "mecha") === "cierre",
+    planInterno: s("V3_RANGO", "swing") === "internal",
+    entradaFib: s("V3_ENTRADA", "lq") === "fib",
+    tpObjetivo: s("V3_TP", "equilibrium") === "objetivo",
+    entryRatio: n("V3_ENTRY_RATIO", 0.7),
+    fib2: n("V3_FIB2", 0.618),
+    slBuffer: n("V3_SL_BUFFER", 0),
+    fAlinear: s("V3_F_ALINEACION", "1") !== "0",
+    fHtf: s("V3_F_HTF", "1") !== "0",
+    fZona: s("V3_F_ZONA", "1") !== "0",
+    htf: process.env.V3_HTF || "15min",
+    htfInterno: s("V3_HTF_ESTRUCTURA", "internal") !== "swing",
+    decimales: n("TV_DECIMALES", 2),
+  };
+}
+
+// Pierna (leg) de LuxAlgo. Devuelve el cambio de pierna: 1 = pivote bajo, -1 = pivote alto.
+function v3Leg(velas, i, len, est) {
+  const c = i - len;
+
+  if (c >= 0) {
+    let max = -Infinity;
+    let min = Infinity;
+
+    for (let k = i - len + 1; k <= i; k++) {
+      if (velas[k].high > max) max = velas[k].high;
+      if (velas[k].low < min) min = velas[k].low;
+    }
+
+    if (velas[c].high > max) est.leg = 0;
+    else if (velas[c].low < min) est.leg = 1;
+  }
+
+  const cambio = est.leg - est.prev;
+  est.prev = est.leg;
+  return cambio;
+}
+
+// Tendencia de estructura del timeframe superior (f_structureBias del Pine).
+function v3BiasEstructura(velas, len) {
+  const leg = { leg: 0, prev: 0 };
+  let hi = null, lo = null, hiAnt = null, loAnt = null;
+  let hiCr = false, loCr = false, bias = 0;
+
+  for (let i = 0; i < velas.length; i++) {
+    const cambio = v3Leg(velas, i, len, leg);
+
+    if (cambio === 1) { lo = velas[i - len].low; loCr = false; }
+    else if (cambio === -1) { hi = velas[i - len].high; hiCr = false; }
+
+    const c = velas[i].close;
+    const cp = i > 0 ? velas[i - 1].close : null;
+    const up = hi !== null && hiAnt !== null && cp !== null && c > hi && cp <= hiAnt;
+    const dn = lo !== null && loAnt !== null && cp !== null && c < lo && cp >= loAnt;
+
+    if (up && !hiCr) { hiCr = true; bias = 1; }
+    if (dn && !loCr) { loCr = true; bias = -1; }
+
+    hiAnt = hi;
+    loAnt = lo;
+  }
+
+  return bias;
+}
+
+// Motor de estructura de Bias Toolkit V.3 (LuxAlgo + LQ + PROTEGIDO/OBJETIVO + zona 0.618).
+function biasV3(velas, cfg) {
+  const piv = () => ({ lvl: null, ant: null, crossed: false, idx: null });
+  const sH = piv(), sL = piv(), iH = piv(), iL = piv();
+  const swT = { bias: 0 }, inT = { bias: 0 };
+  const tr = { top: null, bottom: null };
+  const itr = { top: null, bottom: null };
+  const legSw = { leg: 0, prev: 0 };
+  const legIn = { leg: 0, prev: 0 };
+  const lqs = [];
+
+  let roleOverride = 0, lqHighBar = null, lqLowBar = null;
+  let zoneTouched = false, planBias = 0, planTop = null, planBottom = null;
+  let dirNow = 0, hiNow = null, loNow = null;
+
+  const addLq = (pv, esAlto) => {
+    const ultimo = esAlto ? lqHighBar : lqLowBar;
+
+    if (pv.lvl !== null && pv.idx !== null && (ultimo ?? -1) !== pv.idx) {
+      lqs.push({ lvl: pv.lvl, side: esAlto ? 1 : -1, neut: -1 });
+      while (lqs.length > cfg.lqMax) lqs.shift();
+
+      if (esAlto) lqHighBar = pv.idx;
+      else lqLowBar = pv.idx;
+    }
+  };
+
+  for (let i = 0; i < velas.length; i++) {
+    const v = velas[i];
+    const cp = i > 0 ? velas[i - 1].close : null;
+
+    // 1) extremos (trailing)
+    for (const t of [tr, itr]) {
+      if (t.top !== null && v.high >= t.top) t.top = v.high;
+      if (t.bottom !== null && v.low <= t.bottom) t.bottom = v.low;
+    }
+
+    // 2) pivotes
+    const pivotes = (len, leg, pH, pL, t) => {
+      const cambio = v3Leg(velas, i, len, leg);
+
+      if (cambio === 1) {
+        pL.lvl = velas[i - len].low; pL.crossed = false; pL.idx = i - len;
+        t.bottom = pL.lvl;
+      } else if (cambio === -1) {
+        pH.lvl = velas[i - len].high; pH.crossed = false; pH.idx = i - len;
+        t.top = pH.lvl;
+      }
+    };
+
+    pivotes(cfg.swingLen, legSw, sH, sL, tr);
+    pivotes(cfg.internalLen, legIn, iH, iL, itr);
+
+    // 3) BOS / CHoCH (primero interna, después swing)
+    const estructura = (interna) => {
+      const hi = interna ? iH : sH;
+      const lo = interna ? iL : sL;
+      const T = interna ? inT : swT;
+
+      const cruzaArriba =
+        hi.lvl !== null && hi.ant !== null && cp !== null && v.close > hi.lvl && cp <= hi.ant;
+      const extraH = interna ? iH.lvl !== sH.lvl : true;
+
+      if (cruzaArriba && !hi.crossed && extraH) {
+        const tag = T.bias === -1 ? "CHOCH" : "BOS";
+        hi.crossed = true;
+        T.bias = 1;
+
+        if (interna && tag === "BOS") { roleOverride = 1; addLq(iL, false); }
+        else roleOverride = 0;
+      }
+
+      const cruzaAbajo =
+        lo.lvl !== null && lo.ant !== null && cp !== null && v.close < lo.lvl && cp >= lo.ant;
+      const extraL = interna ? iL.lvl !== sL.lvl : true;
+
+      if (cruzaAbajo && !lo.crossed && extraL) {
+        const tag = T.bias === 1 ? "CHOCH" : "BOS";
+        lo.crossed = true;
+        T.bias = -1;
+
+        if (interna && tag === "BOS") { roleOverride = -1; addLq(iH, true); }
+        else roleOverride = 0;
+      }
+    };
+
+    estructura(true);
+    estructura(false);
+
+    // 4) neutralización de LQ
+    for (const q of lqs) {
+      if (q.neut >= 0) continue;
+      const alto = q.side === 1;
+      const barrido = cfg.lqCierre
+        ? (alto ? v.close > q.lvl : v.close < q.lvl)
+        : (alto ? v.high > q.lvl : v.low < q.lvl);
+
+      if (barrido) q.neut = i;
+    }
+
+    // 5) rango y dirección del plan + "precio llegó al 0.618"
+    const roleBias = roleOverride !== 0 ? roleOverride : swT.bias;
+    const dir = cfg.planInterno ? inT.bias : roleBias;
+    const hi = cfg.planInterno ? itr.top : tr.top;
+    const lo = cfg.planInterno ? itr.bottom : tr.bottom;
+
+    if (dir !== planBias || (hi ?? -1) !== (planTop ?? -1) || (lo ?? -1) !== (planBottom ?? -1)) {
+      zoneTouched = false;
+      planBias = dir;
+      planTop = hi;
+      planBottom = lo;
+    }
+
+    if (dir !== 0 && hi !== null && lo !== null && hi > lo) {
+      const rng = hi - lo;
+      const ratio = Math.min(cfg.fib2, cfg.entryRatio);
+      const toco = dir === 1 ? v.low <= hi - rng * ratio : v.high >= lo + rng * ratio;
+      zoneTouched = zoneTouched || toco;
+    }
+
+    dirNow = dir; hiNow = hi; loNow = lo;
+
+    for (const p of [sH, sL, iH, iL]) p.ant = p.lvl;
+  }
+
+  return {
+    swBias: swT.bias, inBias: inT.bias,
+    roleBias: roleOverride !== 0 ? roleOverride : swT.bias,
+    dir: dirNow, hi: hiNow, lo: loNow,
+    swHi: tr.top, swLo: tr.bottom,
+    zoneTouched, lqs,
+  };
+}
+
+// Plan de operación (entrada en LQ o Fib, SL en el extremo PROTEGIDO, TP en Equilibrium u OBJETIVO).
+function planV3(est, velas, cfg, htf) {
+  const ult = velas.length - 1;
+  const cierre = velas[ult].close;
+  const { dir, hi, lo } = est;
+
+  const alineadas = est.swBias !== 0 && est.swBias === est.inBias;
+  const swingFavor = est.swBias !== 0 && est.swBias === dir;
+
+  const r = {
+    okAlin: !cfg.fAlinear || (cfg.entradaFib ? alineadas : swingFavor),
+    okHtf: !cfg.fHtf || !htf.disponible || (htf.bias !== 0 && htf.bias === dir),
+    okZona: !cfg.fZona || est.zoneTouched,
+    lq: null,
+    plan: null,
+  };
+
+  if (dir === 0 || hi === null || lo === null || !(hi > lo)) return r;
+
+  const largo = dir === 1;
+  const sl = largo ? lo - cfg.slBuffer : hi + cfg.slBuffer;
+  const tp = cfg.tpObjetivo ? (largo ? hi : lo) : (hi + lo) / 2;
+  const enRango = (lv) => (largo ? lv > sl && lv < tp : lv < sl && lv > tp);
+
+  let entrada = null;
+  let activada = false;
+
+  if (!cfg.entradaFib) {
+    const lado = largo ? -1 : 1;
+    let mejor = -1;
+    let mejorNb = -1;
+
+    est.lqs.forEach((q, k) => {
+      if (q.side === lado && q.neut >= 0 && ult - q.neut <= cfg.lqWindow && enRango(q.lvl) && q.neut > mejorNb) {
+        mejor = k;
+        mejorNb = q.neut;
+      }
+    });
+
+    if (mejor === -1) {
+      let mejorDist = null;
+
+      est.lqs.forEach((q, k) => {
+        if (q.side === lado && q.neut < 0 && enRango(q.lvl)) {
+          const d = Math.abs(q.lvl - cierre);
+
+          if (mejorDist === null || d < mejorDist) {
+            mejor = k;
+            mejorDist = d;
+          }
+        }
+      });
+    }
+
+    r.lq = mejor >= 0;
+
+    if (mejor >= 0) {
+      entrada = est.lqs[mejor].lvl;
+      activada = est.lqs[mejor].neut >= 0;
+    }
+  } else {
+    entrada = largo ? hi - (hi - lo) * cfg.entryRatio : lo + (hi - lo) * cfg.entryRatio;
+    activada = largo ? cierre <= entrada : cierre >= entrada;
+  }
+
+  if (entrada !== null && enRango(entrada)) {
+    const f = (x) => Number(x.toFixed(cfg.decimales));
+    r.plan = { side: largo ? "BUY" : "SELL", entrada: f(entrada), sl: f(sl), tp: f(tp), activada };
+  }
+
+  return r;
+}
+
+async function analizarEntradas(chat) {
+  await tg("sendChatAction", { chat_id: chat, action: "typing" }).catch(() => {});
+
+  const cfg = v3Config();
+  const { velas, ms, intervalo } = await traerVelasDe(process.env.TV_INTERVAL || "1min", process.env.TV_VELAS || "1500");
+
+  if (velas.length < 200) throw new Error("Pocas velas para calcular");
+
+  // Filtro del timeframe superior (última vela cerrada). Se omite si el gráfico ya es de ese timeframe o mayor.
+  const htfMs = TV_INTERVALOS[cfg.htf];
+  const htf = { disponible: Boolean(htfMs) && ms <= htfMs, bias: 0 };
+
+  if (cfg.fHtf && htf.disponible) {
+    const rh = await traerVelasDe(cfg.htf, 500);
+    htf.bias = v3BiasEstructura(rh.velas, cfg.htfInterno ? cfg.internalLen : cfg.swingLen);
+  }
+
+  const est = biasV3(velas, cfg);
+  const r = planV3(est, velas, cfg, htf);
+  const ult = velas[velas.length - 1];
+  const precio = ult.close;
+
+  const d = (x) => (x == null ? "-" : Number(x).toFixed(cfg.decimales));
+  const flecha = (t) => (t === 1 ? "▲" : t === -1 ? "▼" : "—");
+  const ok = (b) => (b ? "✓" : "✗");
+  const altoRol = est.roleBias === -1 ? "PROTEGIDO" : "OBJETIVO";
+  const bajoRol = est.roleBias === 1 ? "PROTEGIDO" : "OBJETIVO";
+  const dirTxt = est.dir === 1 ? "COMPRA" : est.dir === -1 ? "VENTA" : "sin dirección";
+
+  const informe =
+    `🔍 XAUUSD ${intervalo} · Bias Toolkit V.3\n` +
+    `Precio ${d(precio)} · vela ${new Date(ult.t).toISOString().slice(11, 16)} UTC\n\n` +
+    `Swing ${flecha(est.swBias)} · Interna ${flecha(est.inBias)} · ${cfg.htf} ${htf.disponible ? flecha(htf.bias) : "n/a"}\n` +
+    `swh ${d(est.swHi)} ${altoRol} · swl ${d(est.swLo)} ${bajoRol}\n` +
+    `Plan: ${dirTxt}\n\n` +
+    `Alineación ${ok(r.okAlin)} · HTF ${ok(r.okHtf)} · Zona ${ok(r.okZona)}` +
+    (r.lq === null ? "" : ` · LQ ${ok(r.lq)}`);
+
+  const filtrosOk = r.okAlin && r.okHtf && r.okZona;
+  let lectura = null;
+  let motivo = "";
+
+  if (est.dir === 0) {
+    motivo = "Sin dirección definida todavía.";
+  } else if (!filtrosOk) {
+    const f = [];
+    if (!r.okAlin) f.push(cfg.entradaFib ? "swing e interna no alineadas" : "el swing no va a favor del plan");
+    if (!r.okHtf) f.push(`${cfg.htf} no confirma la dirección`);
+    if (!r.okZona) f.push("el precio aún no llegó al 0.618");
+    motivo = f.join("; ") + ".";
+  } else if (!r.plan) {
+    motivo = cfg.entradaFib ? "La entrada Fib queda fuera del rango SL–TP." : "No hay un LQ válido para la entrada.";
+  } else {
+    const p = r.plan;
+    const pasado = p.side === "BUY" ? precio <= p.sl || precio >= p.tp : precio >= p.sl || precio <= p.tp;
+
+    if (pasado) {
+      motivo = "El precio ya superó el SL o el TP del plan.";
+    } else {
+      lectura = {
+        instrumento: "XAUUSD",
+        direccion: p.side,
+        entrada: p.entrada,
+        stop_loss: p.sl,
+        take_profit_1: p.tp,
+        take_profit_2: null,
+        take_profit_3: null,
+        precio_actual: precio,
+        varias_posiciones: false,
+        observaciones: `Bias Toolkit V.3 · ${intervalo} · ${cfg.entradaFib ? "entrada Fib" : p.activada ? "LQ neutralizado" : "LQ activo"} · precio ${d(precio)}`,
+      };
+
+      const err = validar(lectura);
+
+      if (err) {
+        lectura = null;
+        motivo = `Plan descartado: ${err}.`;
+      }
+    }
+  }
+
+  if (!lectura) {
+    await enviar(chat, `${informe}\n\nSin entrada vigente: ${motivo}`, { reply_markup: TECLADO_MENU });
+    return;
+  }
+
+  await enviar(chat, informe);
+
+  await entregar(
+    chat,
+    armarSenal(lectura, { estado: r.plan.activada ? "mercado" : "LIMIT PENDIENTE", origen: "automática" }),
+    lectura,
+    false
+  );
+}
+
+// Evita que dos toques seguidos gasten consultas de Twelve Data por duplicado.
+let analizando = false;
+
+async function analizarSeguro(chat) {
+  if (analizando) {
+    await enviar(chat, "Ya estoy analizando, esperá unos segundos.").catch(() => {});
+    return;
+  }
+
+  analizando = true;
+
+  try {
+    await analizarEntradas(chat);
+  } catch (e) {
+    await enviar(chat, `No pude analizar: ${e.message}`, { reply_markup: TECLADO_MENU }).catch(() => {});
+  } finally {
+    analizando = false;
+  }
+}
 
 iniciarVelas();
