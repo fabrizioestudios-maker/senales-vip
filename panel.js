@@ -12,17 +12,25 @@ const RUTA =
 const GRUPOS = [
   { n: "Envío y destinos", d: "Qué se publica solo y adónde sale. Para apagar un destino, dejalo vacío con '-'." },
   { n: "Seguridad", d: "Controles que descartan señales con datos raros." },
-  { n: "Datos de mercado", d: "Velas de Twelve Data. Cambiar intervalo o frecuencia reinicia el ciclo." },
+  { n: "Datos de mercado", d: "Velas de Twelve Data. El instrumento cambia símbolo, mintick y decimales juntos (US100 usa el índice NDX, que Twelve Data da solo en planes pagos). Cambiar intervalo o frecuencia reinicia el ciclo." },
   { n: "Motor V.2", d: "Señales automáticas por velas. Tiene que coincidir con los settings del Pine de Bias Toolkit V.2." },
   { n: "V.3 Estructura", d: "Botón Analizar entradas: estructura y timeframe superior." },
   { n: "V.3 Entrada y salida", d: "Botón Analizar entradas: dónde entra, SL y TP del plan." },
   { n: "V.3 Liquidez y filtros", d: "Botón Analizar entradas: liquidez (LQ) y filtros que habilitan la entrada." },
+  { n: "Capturas (Gemini)", d: "Modelos que leen las capturas de TradingView. Si Google da de baja un modelo, corregí el nombre acá." },
 ];
+
+// Instrumentos: cambian símbolo de datos, etiqueta, mintick y decimales juntos.
+const PRESETS = {
+  XAUUSD: { TV_SYMBOL: "XAU/USD", INSTRUMENTO_DEFECTO: "XAUUSD", TV_MINTICK: "0.01", TV_DECIMALES: "2" },
+  EURUSD: { TV_SYMBOL: "EUR/USD", INSTRUMENTO_DEFECTO: "EURUSD", TV_MINTICK: "0.00001", TV_DECIMALES: "5" },
+  US100: { TV_SYMBOL: "NDX", INSTRUMENTO_DEFECTO: "US100", TV_MINTICK: "0.01", TV_DECIMALES: "2" },
+};
 
 const B = (g, k, n, def, pos) => ({ g, k, n, t: "bool", def, pos });
 const E = (g, k, n, def, op) => ({ g, k, n, t: "enum", def, op });
 const N = (g, k, n, def, paso, min, max) => ({ g, k, n, t: "num", def, paso, min, max });
-const T = (g, k, n) => ({ g, k, n, t: "txt", def: "" });
+const T = (g, k, n, def = "") => ({ g, k, n, t: "txt", def });
 
 const PARAMS = [
   // 0 Envío y destinos
@@ -75,6 +83,11 @@ const PARAMS = [
   B(6, "V3_F_ALINEACION", "Filtro alineación", "1", false),
   B(6, "V3_F_HTF", "Filtro HTF", "1", false),
   B(6, "V3_F_ZONA", "Filtro zona", "1", false),
+  // Agregados después (van al final para no mover los botones de paneles ya abiertos)
+  { ...E(2, "INSTRUMENTO_DEFECTO", "Instrumento", "XAUUSD", Object.keys(PRESETS)), preset: PRESETS, top: true },
+  T(2, "TV_SYMBOL", "Símbolo datos", "XAU/USD"),
+  T(7, "GEMINI_MODEL", "Modelo 1", "gemini-3.8-flash"),
+  T(7, "GEMINI_MODEL_2", "Modelo 2", "gemini-3.6-flash"),
 ];
 
 const base = {}; // valores originales (Railway) para poder restablecer
@@ -116,7 +129,7 @@ function ver(p) {
     return j >= 0 ? p.op[j] : String(crudo(p));
   }
   if (p.t === "num") return String(redondear(numero(p)));
-  const v = process.env[p.k];
+  const v = process.env[p.k] || p.def;
   if (!v) return "apagado";
   return v.length > 22 ? v.slice(0, 10) + "…" + v.slice(-8) : v;
 }
@@ -125,7 +138,7 @@ function defecto(p) {
   const b = base[p.k];
   if (b !== undefined && b !== "") return b;
   if (p.t === "bool") return p.def === "1" ? "SÍ" : "NO";
-  return p.t === "txt" ? "vacío" : String(p.def);
+  return p.t === "txt" ? p.def || "vacío" : String(p.def);
 }
 
 // ---------- cambios ----------
@@ -139,11 +152,26 @@ function fijar(i, valor) {
 
 function restablecer(i) {
   const p = PARAMS[i];
-  delete cfg[p.k];
-  if (base[p.k] === undefined) delete process.env[p.k];
-  else process.env[p.k] = base[p.k];
+  const claves = p.preset ? Object.keys(Object.values(p.preset)[0]) : [p.k];
+
+  for (const k of claves) {
+    delete cfg[k];
+    if (base[k] === undefined) delete process.env[k];
+    else process.env[k] = base[k];
+  }
+
   guardar();
-  alCambiar(p.k);
+  alCambiar(claves.includes("TV_SYMBOL") ? "TV_SYMBOL" : p.k);
+}
+
+function fijarPreset(p, nombre) {
+  for (const [k, v] of Object.entries(p.preset[nombre])) {
+    cfg[k] = v;
+    process.env[k] = v;
+  }
+
+  guardar();
+  alCambiar("TV_SYMBOL");
 }
 
 // ---------- persistencia ----------
@@ -266,7 +294,10 @@ function principal(chat, mid) {
 function grupo(chat, mid, g, nota) {
   const filas = [];
 
-  PARAMS.forEach((p, i) => {
+  const orden = PARAMS.map((p, i) => i).sort((a, b) => Number(!!PARAMS[b].top) - Number(!!PARAMS[a].top) || a - b);
+
+  orden.forEach((i) => {
+    const p = PARAMS[i];
     if (p.g !== g) return;
 
     const etiqueta = { text: `${p.n}: ${ver(p)}`, callback_data: `p:${p.t === "num" || p.t === "txt" ? "e" : "t"}:${i}` };
@@ -328,6 +359,7 @@ async function alBoton(cb) {
       await tg("deleteMessage", { chat_id: chat, message_id: mid }).catch(() => {});
     } else if (acc === "t" && p) {
       if (p.t === "bool") fijar(i, activo(p) ? "0" : "1");
+      else if (p.preset) fijarPreset(p, p.op[(idxEnum(p) + 1) % p.op.length]);
       else fijar(i, p.op[(idxEnum(p) + 1) % p.op.length]);
       aviso = `${p.n}: ${ver(p)}`;
       await grupo(chat, mid, p.g);
