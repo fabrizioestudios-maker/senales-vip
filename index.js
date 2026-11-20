@@ -1,6 +1,7 @@
 // TRADING INSTITUCIONAL | Bot de señales VIP (Railway)
 const express = require("express");
 const crypto = require("crypto");
+const Panel = require("./panel");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
@@ -60,7 +61,10 @@ Sin imagen:
 
 // Botón "Analizar entradas" (también con /menu o /analizar)
 const TECLADO_MENU = {
-  inline_keyboard: [[{ text: "🔍 Analizar entradas", callback_data: "analizar" }]],
+  inline_keyboard: [
+    [{ text: "🔍 Analizar entradas", callback_data: "analizar" }],
+    [{ text: "Ajustes", callback_data: "p:m" }],
+  ],
 };
 
 const PORT = process.env.PORT || 3000;
@@ -292,6 +296,12 @@ async function procesar(update) {
       return await enviar(m.chat.id, "Panel de señales:", { reply_markup: TECLADO_MENU });
     }
 
+    if (/^\/panel\b/i.test(texto)) {
+      return await Panel.abrir(m.chat.id);
+    }
+
+    if (await Panel.alTexto(m, texto)) return;
+
     await enviar(m.chat.id, AYUDA, { reply_markup: TECLADO_MENU });
   } catch (e) {
     if (dueño) {
@@ -481,6 +491,8 @@ async function alTocarBoton(cb, dueño) {
   if (String(cb.from.id) !== dueño || !cb.message) {
     return responder("No autorizado");
   }
+
+  if (String(cb.data || "").startsWith("p:")) return Panel.alBoton(cb);
 
   const chat = cb.message.chat.id;
   const mid = cb.message.message_id;
@@ -1383,6 +1395,8 @@ async function revisarVelas() {
   }
 }
 
+let tvTimer = null;
+
 function iniciarVelas() {
   if (!process.env.TWELVEDATA_KEY) {
     console.log("Señales por velas desactivadas (falta TWELVEDATA_KEY)");
@@ -1394,7 +1408,8 @@ function iniciarVelas() {
   const cada = Math.max(ms, Number(process.env.TV_POLL_SEG || 180) * 1000);
 
   setTimeout(revisarVelas, 5000);
-  setInterval(revisarVelas, cada);
+  clearInterval(tvTimer);
+  tvTimer = setInterval(revisarVelas, cada);
 
   console.log(
     `Señales por velas activas (cada ${Math.round(cada / 1000)} s, publicación automática: ${autoTV() ? "SÍ" : "no"})`
@@ -1870,4 +1885,17 @@ async function analizarSeguro(chat) {
   }
 }
 
-iniciarVelas();
+let reinicioVelas = null;
+
+Panel.iniciar({
+  tg,
+  owner: () => String(process.env.OWNER_ID || ""),
+  alCambiar: (k) => {
+    if (k !== "TV_INTERVAL" && k !== "TV_POLL_SEG") return;
+    if (k === "TV_INTERVAL") tvUltimaVela = null;
+    clearTimeout(reinicioVelas);
+    reinicioVelas = setTimeout(iniciarVelas, 1500);
+  },
+})
+  .catch((e) => console.error("Panel:", e.message))
+  .finally(iniciarVelas);
