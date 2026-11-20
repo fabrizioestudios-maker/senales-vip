@@ -19,6 +19,9 @@ const fetchT = (url, opts = {}, ms = 45000) => fetch(url, { ...opts, signal: Abo
 
 const pausa = (ms) => new Promise((ok) => setTimeout(ok, ms));
 
+// Instrumento elegido en el panel (INSTRUMENTO_DEFECTO). XAUUSD si no hay nada cargado.
+const instrumentoActual = () => String(process.env.INSTRUMENTO_DEFECTO || "XAUUSD").toUpperCase();
+
 const TITULO = "*TRADING INSTITUCIONAL | SIGNALS VIP*";
 const AVISO_RIESGO =
   "Recordá utilizar un riesgo máximo del 1% de tu capital en esta operación y calcular el tamaño de la posición según la distancia al Stop Loss.";
@@ -1347,7 +1350,7 @@ async function revisarVelas() {
 
       try {
         const lectura = {
-          instrumento: "XAUUSD",
+          instrumento: instrumentoActual(),
           direccion: s.side,
           entrada: s.entry,
           stop_loss: s.sl,
@@ -1799,7 +1802,7 @@ async function analizarEntradas(chat) {
   const dirTxt = est.dir === 1 ? "COMPRA" : est.dir === -1 ? "VENTA" : "sin dirección";
 
   const informe =
-    `🔍 XAUUSD ${intervalo} · Bias Toolkit V.3\n` +
+    `🔍 ${instrumentoActual()} ${intervalo} · Bias Toolkit V.3\n` +
     `Precio ${d(precio)} · vela ${new Date(ult.t).toISOString().slice(11, 16)} UTC\n\n` +
     `Swing ${flecha(est.swBias)} · Interna ${flecha(est.inBias)} · ${cfg.htf} ${htf.disponible ? flecha(htf.bias) : "n/a"}\n` +
     `swh ${d(est.swHi)} ${altoRol} · swl ${d(est.swLo)} ${bajoRol}\n` +
@@ -1829,7 +1832,7 @@ async function analizarEntradas(chat) {
       motivo = "El precio ya superó el SL o el TP del plan.";
     } else {
       lectura = {
-        instrumento: "XAUUSD",
+        instrumento: instrumentoActual(),
         direccion: p.side,
         entrada: p.entrada,
         stop_loss: p.sl,
@@ -1891,6 +1894,7 @@ Panel.iniciar({
   tg,
   owner: () => String(process.env.OWNER_ID || ""),
   alCambiar: (k) => {
+    if (k === "TV_SYMBOL") tvUltimaVela = null;
     if (k !== "TV_INTERVAL" && k !== "TV_POLL_SEG") return;
     if (k === "TV_INTERVAL") tvUltimaVela = null;
     clearTimeout(reinicioVelas);
