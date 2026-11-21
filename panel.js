@@ -28,9 +28,10 @@ const PRESETS = {
 };
 
 // Activos del botón "Analizar": símbolo de Twelve Data y decimales. Solo afectan al análisis, no a las señales automáticas.
+// Con "bingx" las velas salen del perpetuo de BingX (el mismo origen que el gráfico); si BingX falla, usa Twelve Data.
 const ACTIVOS = {
   XAUUSD: { simbolo: "XAU/USD", decimales: 2 },
-  BTCUSD: { simbolo: "BTC/USD", decimales: 2 },
+  BTCUSD: { simbolo: "BTC/USD", bingx: "BTC-USDT", decimales: 2 },
   EURUSD: { simbolo: "EUR/USD", decimales: 5 },
   GBPUSD: { simbolo: "GBP/USD", decimales: 5 },
   USDJPY: { simbolo: "USD/JPY", decimales: 3 },
