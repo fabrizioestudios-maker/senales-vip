@@ -63,11 +63,30 @@ Sin imagen:
 (dirección, entrada, stop loss, TP1 y, si querés, TP2 y TP3)\n\n/grupos (lista tus grupos de WhatsApp con su ID)\n\n/analizar (o el botón): busca entradas con Bias Toolkit V.3`;
 
 // Botón "Analizar entradas" (también con /menu o /analizar)
+function activoAnalisis() {
+  const nombre = String(process.env.ACTIVO_ANALISIS || "XAUUSD").toUpperCase();
+  const ok = Boolean(Panel.ACTIVOS[nombre]);
+  return { nombre: ok ? nombre : "XAUUSD", ...Panel.ACTIVOS[ok ? nombre : "XAUUSD"] };
+}
+
+function filasMenu() {
+  const act = activoAnalisis();
+  const botones = Object.keys(Panel.ACTIVOS).map((n) => ({
+    text: n === act.nombre ? `• ${n}` : n,
+    callback_data: `act:${n}`,
+  }));
+  const filas = [[{ text: `Analizar ${act.nombre}`, callback_data: "analizar" }]];
+
+  for (let k = 0; k < botones.length; k += 3) filas.push(botones.slice(k, k + 3));
+
+  filas.push([{ text: "Ajustes", callback_data: "p:m" }]);
+  return filas;
+}
+
 const TECLADO_MENU = {
-  inline_keyboard: [
-    [{ text: "🔍 Analizar entradas", callback_data: "analizar" }],
-    [{ text: "Ajustes", callback_data: "p:m" }],
-  ],
+  get inline_keyboard() {
+    return filasMenu();
+  },
 };
 
 const PORT = process.env.PORT || 3000;
@@ -510,6 +529,21 @@ async function alTocarBoton(cb, dueño) {
   if (cb.data === "cancel") {
     await responder("Cancelada");
     await quitarBotones();
+    return;
+  }
+
+  if (String(cb.data || "").startsWith("act:")) {
+    const nombre = cb.data.slice(4);
+
+    if (!Panel.ACTIVOS[nombre]) return responder("Activo no válido");
+
+    Panel.fijarValor("ACTIVO_ANALISIS", nombre);
+    await responder(`Activo: ${nombre}`);
+    await tg("editMessageReplyMarkup", {
+      chat_id: chat,
+      message_id: mid,
+      reply_markup: TECLADO_MENU,
+    }).catch(() => {});
     return;
   }
 
@@ -1451,7 +1485,7 @@ app.get("/velas/senales", async (req, res) => {
 // BIAS TOOLKIT V.3 (lo usa el botón "Analizar entradas")
 // =====================================================================
 
-async function traerVelasDe(intervalo, cantidad) {
+async function traerVelasDe(intervalo, cantidad, simbolo) {
   const ms = TV_INTERVALOS[intervalo];
 
   if (!ms) throw new Error(`Intervalo no soportado: ${intervalo}`);
@@ -1461,6 +1495,7 @@ async function traerVelasDe(intervalo, cantidad) {
   url.searchParams.set("symbol", process.env.TV_SYMBOL || "XAU/USD");
   url.searchParams.set("interval", intervalo);
   url.searchParams.set("outputsize", String(cantidad));
+  if (simbolo) url.searchParams.set("symbol", simbolo);
   url.searchParams.set("timezone", "UTC");
   url.searchParams.set("apikey", process.env.TWELVEDATA_KEY);
 
@@ -1775,8 +1810,10 @@ function planV3(est, velas, cfg, htf) {
 async function analizarEntradas(chat) {
   await tg("sendChatAction", { chat_id: chat, action: "typing" }).catch(() => {});
 
-  const cfg = v3Config();
-  const { velas, ms, intervalo } = await traerVelasDe(process.env.TV_INTERVAL || "1min", process.env.TV_VELAS || "1500");
+  const act = activoAnalisis();
+  const instrumentoActual = () => act.nombre;
+  const cfg = { ...v3Config(), decimales: act.decimales };
+  const { velas, ms, intervalo } = await traerVelasDe(process.env.TV_INTERVAL || "1min", process.env.TV_VELAS || "1500", act.simbolo);
 
   if (velas.length < 200) throw new Error("Pocas velas para calcular");
 
@@ -1785,7 +1822,7 @@ async function analizarEntradas(chat) {
   const htf = { disponible: Boolean(htfMs) && ms <= htfMs, bias: 0 };
 
   if (cfg.fHtf && htf.disponible) {
-    const rh = await traerVelasDe(cfg.htf, 500);
+    const rh = await traerVelasDe(cfg.htf, 500, act.simbolo);
     htf.bias = v3BiasEstructura(rh.velas, cfg.htfInterno ? cfg.internalLen : cfg.swingLen);
   }
 
