@@ -1,8 +1,8 @@
 # Fase 4 - Signals VIP: ciclo de suscripción
 
-Estado: borrador. **La regla de vencimiento requiere tu confirmación.**
+Estado: regla de vencimiento **confirmada** (2026-11-21). Datos de clientes: Google Sheet privado "TI - Gestión" (confirmado).
 
-## Regla de vencimiento propuesta (una sola)
+## Regla de vencimiento (confirmada)
 
 > **Vencimiento = fecha en que confirmás el pago + 30 días corridos.**
 > Si renueva antes de vencer, los 30 días se suman al vencimiento anterior, no a la fecha del pago. Así nadie pierde días por pagar antes.

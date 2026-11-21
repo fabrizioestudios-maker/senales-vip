@@ -1,1 +1,1 @@
-ID,Fecha UTC,Origen,Instrumento,Dirección,Entrada,SL,TP1,TP2,TP3,Estado inicial,Resultado,Fecha cierre,R obtenido,Notas
+ID,Fecha UTC,ts,Origen,Instrumento,Dirección,Entrada,SL,TP1,TP2,TP3,Estado inicial,Estado,Activación UTC,ts activación,Resultado,Cierre UTC,R,TP máx,Fuente de precios,Notas

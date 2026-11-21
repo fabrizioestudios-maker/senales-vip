@@ -2,6 +2,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const Panel = require("./panel");
+const Registro = require("./registro");
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
@@ -60,7 +61,7 @@ GBPUSD (cambia el instrumento)
 Sin imagen:
 /s buy 4043 4039 4054
 /s sell 4026 4031 4016 4010 mercado
-(dirección, entrada, stop loss, TP1 y, si querés, TP2 y TP3)\n\n/grupos (lista tus grupos de WhatsApp con su ID)\n\n/analizar (o el botón): busca entradas con Bias Toolkit V.3`;
+(dirección, entrada, stop loss, TP1 y, si querés, TP2 y TP3)\n\n/grupos (lista tus grupos de WhatsApp con su ID)\n\n/analizar (o el botón): busca entradas con Bias Toolkit V.3\n\n/resultados: resumen de señales registradas (7 y 30 días)`;
 
 // Botón "Analizar entradas" (también con /menu o /analizar)
 function activoAnalisis() {
@@ -322,6 +323,10 @@ async function procesar(update) {
       return await Panel.abrir(m.chat.id);
     }
 
+    if (/^\/resultados\b/i.test(texto)) {
+      return await Registro.resumen(m.chat.id);
+    }
+
     if (await Panel.alTexto(m, texto)) return;
 
     await enviar(m.chat.id, AYUDA, { reply_markup: TECLADO_MENU });
@@ -477,7 +482,11 @@ async function entregar(chat, senal, lectura, directo = null) {
     let resultado;
 
     try {
-      resultado = resultadoTexto(await publicar(senal.texto));
+      const res = await publicar(senal.texto);
+      resultado = resultadoTexto(res);
+
+      // Registro de la señal en la hoja (no frena ni cambia la publicación).
+      if (res.some(([, ok]) => ok)) Registro.registrar(senal.texto);
     } catch (e) {
       resultado = `No se pudo publicar: ${e.message}`;
     }
@@ -584,6 +593,8 @@ async function alTocarBoton(cb, dueño) {
     await enviar(chat, `No se pudo publicar: ${e.message}. Reenviá la señal para reintentar.`);
     return;
   }
+
+  if (res.some(([, ok]) => ok)) Registro.registrar(texto);
 
   await enviar(chat, resultadoTexto(res));
 }
@@ -1343,6 +1354,9 @@ async function revisarVelas() {
 
     if (velas.length < 100) throw new Error("Pocas velas para calcular");
 
+    // Las mismas velas sirven para seguir las señales abiertas de este instrumento (sin consultas extra).
+    Registro.alVelas(instrumentoActual(), velas, `Twelve Data ${process.env.TV_SYMBOL || "XAU/USD"}`);
+
     const senales = biasToolkit(velas, tvConfig());
     const ultimaT = velas[velas.length - 1].t;
     const ultimoCierre = velas[velas.length - 1].close;
@@ -2005,6 +2019,67 @@ async function analizarSeguro(chat) {
     analizando = false;
   }
 }
+
+// =====================================================================
+// REGISTRO Y SEGUIMIENTO DE SEÑALES (registro.js + Google Sheets)
+// =====================================================================
+
+// De dónde salen los precios para seguir una señal. null = instrumento sin fuente (se cierra a mano).
+function fuenteSeguimiento(clave) {
+  if (clave === instrumentoActual()) {
+    const simbolo = process.env.TV_SYMBOL || "XAU/USD";
+
+    return {
+      tipo: "td",
+      cripto: /BTC|ETH/.test(clave),
+      traer: async (iv, cantidad) => ({ ...(await traerVelasDe(iv, cantidad, simbolo)), fuente: `Twelve Data ${simbolo}` }),
+    };
+  }
+
+  const act = Panel.ACTIVOS[clave];
+  if (!act) return null;
+
+  return {
+    tipo: act.bingx ? "bingx" : "td",
+    cripto: /BTC|ETH/.test(clave),
+    traer: (iv, cantidad) => traerVelasActivo(act, iv, cantidad),
+  };
+}
+
+// Prueba: abrila desde Chrome. Carga una fila marcada PRUEBA en la hoja (no publica nada ni se sigue).
+app.get("/registro/test", async (req, res) => {
+  if (!igual(req.query.key, process.env.TRADINGVIEW_KEY)) {
+    return res.status(403).send("forbidden");
+  }
+
+  if (!Registro.activo()) {
+    return res.status(500).send("Faltan SHEETS_URL / SHEETS_KEY en Railway");
+  }
+
+  const l = {
+    instrumento: "XAUUSD",
+    direccion: "BUY",
+    entrada: 4043,
+    stop_loss: 4039,
+    take_profit_1: 4051,
+  };
+
+  try {
+    const s = await Registro.registrar(armarSenal(l, { estado: "LIMIT PENDIENTE", origen: "manual" }).texto, { prueba: true });
+    if (!s) throw new Error("no se pudo leer la señal de prueba");
+    if (!s.escrito) throw new Error("la hoja no respondió bien (detalle en tu Telegram)");
+    res.send(`OK: fila de prueba ${s.id} cargada en la pestaña Señales. Podés borrarla.`);
+  } catch (e) {
+    res.status(500).send(e.message);
+  }
+});
+
+Registro.iniciar({
+  enviar,
+  owner: () => String(process.env.OWNER_ID || ""),
+  fuente: fuenteSeguimiento,
+  mercadoAbierto,
+}).catch((e) => console.error("Registro:", e.message));
 
 let reinicioVelas = null;
 

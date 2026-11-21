@@ -7,7 +7,8 @@ Repo público: acá va solo documentación y plantillas **sin datos de clientes*
 | `00-lectura-repo.md` | Fase 0: qué hace el bot, riesgos y deuda técnica | Hecho |
 | `01-diagnostico-y-plan.md` | Fase 2: diagnóstico, mapa de procesos, tareas manuales, automatizaciones, herramientas, plan, KPIs, objetivos a 30 y 90 días | Borrador |
 | `02-mentoria-proceso-comercial.md` | Fase 3: proceso comercial, guiones, recuperación de las 40 consultas | Borrador |
-| `03-signals-vip-suscripciones.md` | Fase 4: ciclo de suscripción y regla de vencimiento | Requiere confirmar la regla |
+| `03-signals-vip-suscripciones.md` | Fase 4: ciclo de suscripción y regla de vencimiento | Regla confirmada |
+| `04-registro-senales.md` | Registro y seguimiento automático de señales: configuración desde el celular | Programado y probado; falta configurarlo |
 | `plantillas/*.csv` | Encabezados de las pestañas de la hoja "TI - Gestión" | Listo |
 
 ## Cómo crear la hoja desde el celular
