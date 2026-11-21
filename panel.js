@@ -27,6 +27,16 @@ const PRESETS = {
   US100: { TV_SYMBOL: "NDX", INSTRUMENTO_DEFECTO: "US100", TV_MINTICK: "0.01", TV_DECIMALES: "2" },
 };
 
+// Activos del botón "Analizar": símbolo de Twelve Data y decimales. Solo afectan al análisis, no a las señales automáticas.
+const ACTIVOS = {
+  XAUUSD: { simbolo: "XAU/USD", decimales: 2 },
+  BTCUSD: { simbolo: "BTC/USD", decimales: 2 },
+  EURUSD: { simbolo: "EUR/USD", decimales: 5 },
+  GBPUSD: { simbolo: "GBP/USD", decimales: 5 },
+  USDJPY: { simbolo: "USD/JPY", decimales: 3 },
+  ETHUSD: { simbolo: "ETH/USD", decimales: 2 },
+};
+
 const B = (g, k, n, def, pos) => ({ g, k, n, t: "bool", def, pos });
 const E = (g, k, n, def, op) => ({ g, k, n, t: "enum", def, op });
 const N = (g, k, n, def, paso, min, max) => ({ g, k, n, t: "num", def, paso, min, max });
@@ -88,6 +98,7 @@ const PARAMS = [
   T(2, "TV_SYMBOL", "Símbolo datos", "XAU/USD"),
   T(7, "GEMINI_MODEL", "Modelo 1", "gemini-3.8-flash"),
   T(7, "GEMINI_MODEL_2", "Modelo 2", "gemini-3.6-flash"),
+  E(2, "ACTIVO_ANALISIS", "Activo del análisis", "XAUUSD", Object.keys(ACTIVOS)),
 ];
 
 const base = {}; // valores originales (Railway) para poder restablecer
@@ -440,4 +451,9 @@ async function alTexto(m, texto) {
   return true;
 }
 
-module.exports = { iniciar, abrir, alBoton, alTexto };
+function fijarValor(k, valor) {
+  const i = PARAMS.findIndex((p) => p.k === k);
+  if (i >= 0) fijar(i, valor);
+}
+
+module.exports = { iniciar, abrir, alBoton, alTexto, fijarValor, ACTIVOS };
