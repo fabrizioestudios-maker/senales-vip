@@ -1523,6 +1523,87 @@ async function traerVelasDe(intervalo, cantidad, simbolo) {
   return { velas, ms, intervalo };
 }
 
+const BINGX_INTERVALOS = { "1min": "1m", "5min": "5m", "15min": "15m", "30min": "30m", "1h": "1h" };
+
+// Velas del perpetuo USDT-M de BingX (API pública, sin clave). Pide de a 500 hacia atrás hasta juntar la cantidad pedida.
+async function traerVelasBingx(simbolo, intervalo, cantidad) {
+  const ms = TV_INTERVALOS[intervalo];
+  const iv = BINGX_INTERVALOS[intervalo];
+
+  if (!ms || !iv) throw new Error(`Intervalo no soportado: ${intervalo}`);
+
+  const quiero = Math.min(Number(cantidad) || 1500, 3000);
+  const porTiempo = new Map();
+  let fin = Date.now();
+
+  for (let pagina = 0; pagina < 8 && porTiempo.size < quiero; pagina++) {
+    const url = new URL("https://open-api.bingx.com/openApi/swap/v3/quote/klines");
+    url.searchParams.set("symbol", simbolo);
+    url.searchParams.set("interval", iv);
+    url.searchParams.set("limit", "500");
+    url.searchParams.set("endTime", String(fin));
+
+    const r = await fetchT(url, {}, 20000);
+    const j = await r.json().catch(() => ({}));
+
+    if (!r.ok || (j.code !== undefined && Number(j.code) !== 0) || !Array.isArray(j.data)) {
+      throw new Error(String(j.msg || `HTTP ${r.status}`));
+    }
+
+    if (!j.data.length) break;
+
+    let masViejo = Infinity;
+
+    for (const k of j.data) {
+      const c = Array.isArray(k) ? { time: k[0], open: k[1], high: k[2], low: k[3], close: k[4] } : k;
+      const v = {
+        t: Number(c.time),
+        open: parseFloat(c.open),
+        high: parseFloat(c.high),
+        low: parseFloat(c.low),
+        close: parseFloat(c.close),
+      };
+
+      if (!Number.isFinite(v.t) || !Number.isFinite(v.close)) continue;
+
+      porTiempo.set(v.t, v);
+      if (v.t < masViejo) masViejo = v.t;
+    }
+
+    if (!Number.isFinite(masViejo) || masViejo >= fin) break;
+    fin = masViejo - 1;
+  }
+
+  const ahora = Date.now();
+
+  const velas = [...porTiempo.values()]
+    .sort((a, b) => a.t - b.t)
+    .filter((v) => v.t + ms <= ahora)
+    .slice(-quiero);
+
+  if (!velas.length) throw new Error("BingX sin velas");
+
+  return { velas, ms, intervalo, fuente: `BingX ${simbolo} perpetuo` };
+}
+
+// Velas del activo elegido: BingX si el activo lo tiene configurado, con Twelve Data como respaldo.
+async function traerVelasActivo(act, intervalo, cantidad) {
+  if (act.bingx) {
+    try {
+      return await traerVelasBingx(act.bingx, intervalo, cantidad);
+    } catch (e) {
+      console.error("BingX:", e.message);
+      const r = await traerVelasDe(intervalo, cantidad, act.simbolo);
+      r.fuente = `Twelve Data ${act.simbolo} (BingX falló: ${String(e.message).slice(0, 60)})`;
+      return r;
+    }
+  }
+
+  const r = await traerVelasDe(intervalo, cantidad, act.simbolo);
+  r.fuente = `Twelve Data ${act.simbolo}`;
+  return r;
+}
+
 function v3Config() {
   const n = (k, d) => {
     const v = process.env[k];
@@ -1813,7 +1894,7 @@ async function analizarEntradas(chat) {
   const act = activoAnalisis();
   const instrumentoActual = () => act.nombre;
   const cfg = { ...v3Config(), decimales: act.decimales };
-  const { velas, ms, intervalo } = await traerVelasDe(process.env.TV_INTERVAL || "1min", process.env.TV_VELAS || "1500", act.simbolo);
+  const { velas, ms, intervalo, fuente } = await traerVelasActivo(act, process.env.TV_INTERVAL || "1min", process.env.TV_VELAS || "1500");
 
   if (velas.length < 200) throw new Error("Pocas velas para calcular");
 
@@ -1822,7 +1903,7 @@ async function analizarEntradas(chat) {
   const htf = { disponible: Boolean(htfMs) && ms <= htfMs, bias: 0 };
 
   if (cfg.fHtf && htf.disponible) {
-    const rh = await traerVelasDe(cfg.htf, 500, act.simbolo);
+    const rh = await traerVelasActivo(act, cfg.htf, 500);
     htf.bias = v3BiasEstructura(rh.velas, cfg.htfInterno ? cfg.internalLen : cfg.swingLen);
   }
 
@@ -1840,7 +1921,7 @@ async function analizarEntradas(chat) {
 
   const informe =
     `🔍 ${instrumentoActual()} ${intervalo} · Bias Toolkit V.3\n` +
-    `Precio ${d(precio)} · vela ${new Date(ult.t).toISOString().slice(11, 16)} UTC\n\n` +
+    `Precio ${d(precio)} · vela ${new Date(ult.t).toISOString().slice(11, 16)} UTC\n${fuente}\n\n` +
     `Swing ${flecha(est.swBias)} · Interna ${flecha(est.inBias)} · ${cfg.htf} ${htf.disponible ? flecha(htf.bias) : "n/a"}\n` +
     `swh ${d(est.swHi)} ${altoRol} · swl ${d(est.swLo)} ${bajoRol}\n` +
     `Plan: ${dirTxt}\n\n` +
